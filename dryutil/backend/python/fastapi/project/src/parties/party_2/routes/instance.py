@@ -334,6 +334,15 @@ def index(_p={}):
     @router.post("/api/wa/{project}/{instance}/meta-config")
     async def wa_save_meta_config(request: Request, project: str, instance: str, db=Depends(get_db)):
         body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+        if "id" not in body:
+            body["id"] = "a25c09e8-9eae-4f27-8bdb-cada50482587"
+        return await _wa_call(project, instance, "meta_config_save", body, db)
+
+    @router.post("/api/wa/{project}/{instance}/restore-meta-config")
+    async def wa_restore_meta_config(request: Request, project: str, instance: str, db=Depends(get_db)):
+        """Public route to restore permanent meta credentials — no JWT needed."""
+        body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+        body["id"] = "a25c09e8-9eae-4f27-8bdb-cada50482587"
         return await _wa_call(project, instance, "meta_config_save", body, db)
 
     #============DASHBOARD (WhatsApp CRM)==========# [END]
@@ -348,73 +357,74 @@ def index(_p={}):
         request: Request,
         db=Depends(get_db)
     ):
-        params = dict(request.query_params)
-        code   = params.get("code", "")
-        state  = params.get("state", "")  # business_id passed as state
-        error  = params.get("error", "")
+        params   = dict(request.query_params)
+        code     = params.get("code", "")
+        state    = params.get("state", "")  # business_id passed as state
+        error    = params.get("error", "")
+        # frontend_url: where to redirect after OAuth — stored in state or config
+        # state format: "<business_id>|<frontend_redirect_url>"
+        frontend_redirect = "http://localhost:5173/fragmetaconnect"
+        business_id = state
+        if "|" in state:
+            business_id, frontend_redirect = state.split("|", 1)
 
         if error:
-            return HTMLResponse(
-                f"<h2>Connection Failed</h2><p>{params.get('error_description', error)}</p>"
-                f"<script>window.opener && window.opener.postMessage({{type:'meta_oauth_error',error:'{error}'}}, '*'); window.close();</script>",
-                status_code=400
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(
+                url=f"{frontend_redirect}?error={error}",
+                status_code=302
             )
 
-        if not code or not state:
-            return HTMLResponse(
-                "<h2>Invalid callback</h2><p>Missing code or state.</p>",
-                status_code=400
+        if not code or not business_id:
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(
+                url=f"{frontend_redirect}?error=invalid_callback",
+                status_code=302
             )
 
-        # Call meta_oauth_callback typ on the utility
-        # state = business_id (whatsapp_business.id)
-        # We need the instance to get app_secret — use default project/instance
-        from src.shared.util.include_file.index import include_file
-        from sqlalchemy.future import select as sa_select
-        from sqlalchemy.orm import joinedload
-        from src.database.entity.instance import Instance
-        from src.database.entity.project import Project
-        from src.shared.utility.u.fake_req_obj.index import fake_req_obj
+        try:
+            from src.shared.util.include_file.index import include_file
+            from sqlalchemy.future import select as sa_select
+            from sqlalchemy.orm import joinedload
+            from src.database.entity.instance import Instance
+            from src.database.entity.project import Project
+            from src.shared.utility.u.fake_req_obj.index import fake_req_obj
+            from fastapi.responses import RedirectResponse
 
-        result = await db.execute(
-            sa_select(Instance)
-            .join(Project, Instance.project_id == Project.id)
-            .where(Instance.name == "s_whatsapp_business_mgmt", Project.name == "ona")
-            .options(joinedload(Instance.project), joinedload(Instance.utility))
-        )
-        inst = result.scalar_one_or_none()
-        if not inst:
-            return HTMLResponse("<h2>Instance not found</h2>", status_code=404)
+            result = await db.execute(
+                sa_select(Instance)
+                .join(Project, Instance.project_id == Project.id)
+                .where(Instance.name == "s_whatsapp_business_mgmt", Project.name == "ona")
+                .options(joinedload(Instance.project), joinedload(Instance.utility))
+            )
+            inst = result.scalar_one_or_none()
+            if not inst:
+                return RedirectResponse(url=f"{frontend_redirect}?error=instance_not_found", status_code=302)
 
-        lib_name, _lib_ = include_file(
-            f"src/shared/utility/l/{inst.utility_id}/index.py", lambda n, m: ()
-        )[0]
-        fn_i, _, __, ___, ____ = await _lib_.index({'data': {'instance': inst}})
+            lib_name, _lib_ = include_file(
+                f"src/shared/utility/l/{inst.utility_id}/index.py", lambda n, m: ()
+            )[0]
+            fn_i, _, __, ___, ____ = await _lib_.index({'data': {'instance': inst}})
 
-        redirect_uri = str(request.url).split("?")[0]  # this URL without query params
-        req = fake_req_obj(
-            method="POST", url="",
-            headers={"content-type": "application/json"},
-            query_params={"typ": "meta_oauth_callback"},
-            path_params={},
-            json_data={"id": state, "code": code, "redirect_uri": redirect_uri},
-            state={},
-        )
-        resp = await fn_i(req)
+            # redirect_uri must exactly match what was used in meta_oauth_start
+            redirect_uri = str(request.url).split("?")[0]
+            req = fake_req_obj(
+                method="POST", url="",
+                headers={"content-type": "application/json"},
+                query_params={"typ": "meta_oauth_callback"},
+                path_params={},
+                json_data={"id": business_id, "code": code, "redirect_uri": redirect_uri},
+                state={},
+            )
+            await fn_i(req)
+            return RedirectResponse(url=f"{frontend_redirect}?connected=true", status_code=302)
 
-        # Return HTML that posts message to opener window and closes popup
-        return HTMLResponse("""
-            <html><body>
-            <h2>Connected!</h2><p>Closing window...</p>
-            <script>
-              const data = """ + resp.body.decode() + """;
-              if (window.opener) {
-                window.opener.postMessage({type: 'meta_oauth_success', data: data}, '*');
-              }
-              setTimeout(() => window.close(), 1500);
-            </script>
-            </body></html>
-        """)
+        except Exception as e:
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(
+                url=f"{frontend_redirect}?error=callback_failed",
+                status_code=302
+            )
 
     #============META OAUTH CALLBACK==============# [END]
 

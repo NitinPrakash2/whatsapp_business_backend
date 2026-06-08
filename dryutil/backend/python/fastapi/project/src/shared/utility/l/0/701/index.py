@@ -113,7 +113,7 @@ async def index(_p={'data': {'instance': Any}}):
                 await conn.run_sync(Base.metadata.create_all)
 
     def _err(msg, log):
-        return JSONResponse(content={"success": False, "message": msg, "data": {"log": log}}, status_code=404)
+        return JSONResponse(content={"success": False, "message": msg, "data": {"log": log}}, status_code=200)
 
     def _meta_cfg(row):
         d = row.data or {}
@@ -298,6 +298,30 @@ async def index(_p={'data': {'instance': Any}}):
             "url":          product_url,
             "image_url":    image_url,
         }
+
+    async def _link_catalog_to_waba(token: str, waba_id: str, catalog_id: str, phone_number_id: str):
+        """Link catalog to WABA + enable WhatsApp Shop visibility."""
+        async with httpx.AsyncClient() as client:
+            # 1. link catalog to WABA
+            r1 = await client.post(
+                f"https://graph.facebook.com/v19.0/{waba_id}/product_catalogs",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"catalog_id": catalog_id},
+                timeout=15,
+            )
+            # 2. enable shop + cart on phone number
+            r2 = await client.post(
+                f"https://graph.facebook.com/v19.0/{phone_number_id}/whatsapp_commerce_settings",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"is_catalog_visible": True, "is_cart_enabled": True, "catalog_id": catalog_id},
+                timeout=15,
+            )
+        r1j, r2j = r1.json(), r2.json()
+        # error_subcode 2388099 = already linked — not a real error
+        if r1j.get('error', {}).get('error_subcode') == 2388099:
+            r1j = {'success': True, 'note': 'already_linked'}
+        print(f"[link_catalog] waba_link={r1j} commerce={r2j}")
+        return r1j, r2j
 
     async def _meta_push_one(client: httpx.AsyncClient, token: str, catalog_id: str, payload: dict):
         """POST one product to Meta Catalog. Returns (status_code, json)."""
@@ -919,7 +943,7 @@ async def index(_p={'data': {'instance': Any}}):
                             raise Exception("meta_app_id not configured in instance config")
                         if not redirect_uri:
                             raise Exception("redirect_uri required")
-                        scope = 'whatsapp_business_management,whatsapp_business_messaging,business_management,catalog_management'
+                        scope = 'whatsapp_business_management,whatsapp_business_messaging,catalog_management'
                         auth_url = (
                             f"https://www.facebook.com/v19.0/dialog/oauth"
                             f"?client_id={app_id}"
@@ -990,19 +1014,36 @@ async def index(_p={'data': {'instance': Any}}):
                         auto_phone   = assets["phone_list"][0]["id"]   if len(assets["phone_list"]) == 1   else None
                         auto_catalog = assets["catalog_list"][0]["id"] if len(assets["catalog_list"]) == 1 else None
 
-                        # 5. save config
+                        # 5. save config — preserve existing IDs and token if already set
                         existing_meta = cfg.get('meta', {})
+                        existing_token = existing_meta.get('access_token', '')
+                        # keep permanent system token only if it's explicitly marked as system token
+                        # for real sellers, always use the OAuth token they just granted
+                        existing_meta = cfg.get('meta', {})
+                        is_system_token = cfg.get('is_system_token', False)
+                        final_token = existing_meta.get('access_token', '') if is_system_token else token
                         cfg['meta'] = {
                             **existing_meta,
-                            'access_token':    token,
+                            'access_token':    final_token,
                             'waba_id':         auto_waba    or existing_meta.get('waba_id', ''),
                             'phone_number_id': auto_phone   or existing_meta.get('phone_number_id', ''),
                             'catalog_id':      auto_catalog or existing_meta.get('catalog_id', ''),
                         }
+                        print(f"[oauth_callback] saved meta cfg: waba={cfg['meta']['waba_id']} phone={cfg['meta']['phone_number_id']} catalog={cfg['meta']['catalog_id']} token_kept_existing={bool(existing_token)}")
                         cfg['oauth_connected_at'] = datetime.now(timezone.utc).isoformat()
                         d['config'] = cfg
                         row.data = d
                         await db.commit()
+
+                        # link catalog to WABA + enable WhatsApp Shop after OAuth
+                        _waba_id    = cfg['meta'].get('waba_id', '')
+                        _phone_id   = cfg['meta'].get('phone_number_id', '')
+                        _catalog_id = cfg['meta'].get('catalog_id', '')
+                        if _waba_id and _phone_id and _catalog_id:
+                            try:
+                                await _link_catalog_to_waba(token, _waba_id, _catalog_id, _phone_id)
+                            except Exception as e:
+                                print(f"[oauth_callback] catalog link warning: {e}")
 
                         return JSONResponse(content={"success": True, "data": {
                             "connected":     True,
@@ -1031,36 +1072,49 @@ async def index(_p={'data': {'instance': Any}}):
                         token      = meta.get('access_token', '')
                         catalog_id = meta.get('catalog_id', '')
                         phone_id   = meta.get('phone_number_id', '')
+                        waba_id    = meta.get('waba_id', '')
                         connected  = bool(token)
-                        business_name = catalog_name = phone_number = ''
-                        if connected:
-                            try:
-                                async with httpx.AsyncClient() as client:
-                                    if catalog_id:
-                                        rc = await client.get(
-                                            f"https://graph.facebook.com/v19.0/{catalog_id}",
-                                            params={"access_token": token, "fields": "id,name"}
-                                        )
-                                        catalog_name = rc.json().get('name', '')
-                                    if phone_id:
-                                        rp = await client.get(
-                                            f"https://graph.facebook.com/v19.0/{phone_id}",
-                                            params={"access_token": token, "fields": "display_phone_number,verified_name"}
-                                        )
-                                        pd = rp.json()
-                                        phone_number  = pd.get('display_phone_number', '')
-                                        business_name = pd.get('verified_name', d.get('profile', {}).get('title', ''))
-                            except Exception:
-                                pass
+                        if not connected:
+                            return JSONResponse(content={"success": True, "data": {"connected": False}}, status_code=200)
+                        business_name = catalog_name = phone_number = waba_name = ''
+                        catalog_product_count = 0
+                        try:
+                            async with httpx.AsyncClient() as client:
+                                if catalog_id:
+                                    rc = await client.get(
+                                        f"https://graph.facebook.com/v19.0/{catalog_id}",
+                                        params={"access_token": token, "fields": "id,name,product_count"}
+                                    )
+                                    rcd = rc.json()
+                                    catalog_name          = rcd.get('name', '')
+                                    catalog_product_count = rcd.get('product_count', 0)
+                                if phone_id:
+                                    rp = await client.get(
+                                        f"https://graph.facebook.com/v19.0/{phone_id}",
+                                        params={"access_token": token, "fields": "display_phone_number,verified_name"}
+                                    )
+                                    pd = rp.json()
+                                    phone_number  = pd.get('display_phone_number', '')
+                                    business_name = pd.get('verified_name', d.get('profile', {}).get('title', ''))
+                                if waba_id:
+                                    rw = await client.get(
+                                        f"https://graph.facebook.com/v19.0/{waba_id}",
+                                        params={"access_token": token, "fields": "id,name"}
+                                    )
+                                    waba_name = rw.json().get('name', '')
+                        except Exception:
+                            pass
                         return JSONResponse(content={"success": True, "data": {
-                            "connected":     connected,
-                            "business_name": business_name or d.get('profile', {}).get('title', ''),
-                            "catalog_name":  catalog_name,
-                            "catalog_id":    catalog_id,
-                            "phone_number":  phone_number,
-                            "waba_id":       meta.get('waba_id', ''),
-                            "connected_at":  cfg.get('oauth_connected_at'),
-                            "access_token_set": connected,
+                            "connected":             True,
+                            "business_name":         business_name or d.get('profile', {}).get('title', ''),
+                            "waba_name":             waba_name,
+                            "phone_number":          phone_number,
+                            "catalog_name":          catalog_name,
+                            "catalog_product_count": catalog_product_count,
+                            "catalog_id":            catalog_id,
+                            "waba_id":               waba_id,
+                            "connected_at":          cfg.get('oauth_connected_at'),
+                            "access_token_set":      True,
                         }}, status_code=200)
 
                     case 'meta_connect':
@@ -1123,17 +1177,27 @@ async def index(_p={'data': {'instance': Any}}):
                                                   params={"access_token": token})
                             token_ok = "id" in r.json()
                             if catalog_id:
-                                r2 = await client.get(
-                                    f"https://graph.facebook.com/v19.0/{catalog_id}",
-                                    params={"access_token": token, "fields": "id,name,product_count"}
-                                )
-                                catalog_ok = "id" in r2.json()
+                                try:
+                                    r2 = await client.get(
+                                        f"https://graph.facebook.com/v19.0/{catalog_id}",
+                                        params={"access_token": token, "fields": "id,name,product_count"}
+                                    )
+                                    catalog_ok = "id" in r2.json()
+                                except Exception:
+                                    catalog_ok = False
+                            else:
+                                catalog_ok = True  # not configured, skip check
                             if waba_id:
-                                r3 = await client.get(
-                                    f"https://graph.facebook.com/v19.0/{waba_id}",
-                                    params={"access_token": token, "fields": "id,name"}
-                                )
-                                waba_ok = "id" in r3.json()
+                                try:
+                                    r3 = await client.get(
+                                        f"https://graph.facebook.com/v19.0/{waba_id}",
+                                        params={"access_token": token, "fields": "id,name"}
+                                    )
+                                    waba_ok = "id" in r3.json()
+                                except Exception:
+                                    waba_ok = False
+                            else:
+                                waba_ok = True  # not configured, skip check
                         all_ok = token_ok and catalog_ok and waba_ok
                         return JSONResponse(content={"success": True, "data": {
                             "meta_connected":     token_ok,
@@ -1153,26 +1217,30 @@ async def index(_p={'data': {'instance': Any}}):
                         token      = meta.get('access_token')
                         catalog_id = meta.get('catalog_id')
                         phone_number_id = meta.get('phone_number_id', '')
-                        if not token or not catalog_id:
-                            raise Exception("access_token and catalog_id required")
+                        if not token:
+                            raise Exception("access_token required")
+                        catalog_name = ''
+                        catalog_product_count = 0
+                        phone_display = ''
                         async with httpx.AsyncClient() as client:
-                            r = await client.get(
-                                f"https://graph.facebook.com/v19.0/{catalog_id}",
-                                params={"access_token": token,
-                                        "fields": "id,name,product_count,vertical,da_display_settings"}
-                            )
-                            # fetch phone number display
-                            phone_display = ''
+                            if catalog_id:
+                                r = await client.get(
+                                    f"https://graph.facebook.com/v19.0/{catalog_id}",
+                                    params={"access_token": token,
+                                            "fields": "id,name,product_count,vertical,da_display_settings"}
+                                )
+                                d = r.json()
+                                if "error" in d:
+                                    print(f"[catalog_details] meta error: {d['error']}")
+                                else:
+                                    catalog_name = d.get('name', '')
+                                    catalog_product_count = d.get('product_count', 0)
                             if phone_number_id:
                                 rp = await client.get(
                                     f"https://graph.facebook.com/v19.0/{phone_number_id}",
                                     params={"access_token": token, "fields": "display_phone_number"}
                                 )
                                 phone_display = rp.json().get('display_phone_number', '')
-                        d = r.json()
-                        if "error" in d:
-                            raise Exception(d["error"].get("message", "Meta API error"))
-                        # get last sync info
                         run = (await db.execute(
                             select(CatalogSyncHistory)
                             .where(CatalogSyncHistory.business_id == str(row.id))
@@ -1180,13 +1248,16 @@ async def index(_p={'data': {'instance': Any}}):
                             .limit(1)
                         )).scalar_one_or_none()
                         return JSONResponse(content={"success": True, "data": {
-                            "meta_connected":        bool(token),
-                            "business_name":         (row.data or {}).get('profile', {}).get('title', ''),
-                            "catalog_name":          d.get('name', ''),
-                            "catalog_id":            d.get('id', catalog_id),
-                            "phone_number":          phone_display,
-                            "total_catalog_products": d.get('product_count', 0),
-                            "last_updated":          run.completed_at.isoformat() if run and run.completed_at else None,
+                            "meta_connected":         bool(token),
+                            "catalog_connected":      bool(catalog_id),
+                            "business_name":          (row.data or {}).get('profile', {}).get('title', ''),
+                            "catalog_name":           catalog_name,
+                            "catalog_id":             catalog_id or '',
+                            "phone_number":           phone_display,
+                            "total_products":         catalog_product_count,
+                            "total_catalog_products": catalog_product_count,
+                            "catalog_product_count":  catalog_product_count,
+                            "last_updated":           run.completed_at.isoformat() if run and run.completed_at else None,
                         }}, status_code=200)
 
                     # ── catalog_sync_full — full sync with proper history tracking ─────
@@ -1284,6 +1355,15 @@ async def index(_p={'data': {'instance': Any}}):
                             f"UPDATE whatsapp_business SET data = jsonb_set(data, '{{catalog}}', '{catalog_json}'::jsonb) WHERE id = '{business_id_str}'::uuid"
                         ))
                         await db.commit()
+
+                        # link catalog to WABA + enable WhatsApp Shop
+                        waba_id    = meta.get('waba_id', '')
+                        phone_id_  = meta.get('phone_number_id', '')
+                        if waba_id and phone_id_ and catalog_id:
+                            try:
+                                await _link_catalog_to_waba(token, waba_id, catalog_id, phone_id_)
+                            except Exception as e:
+                                print(f"[catalog_sync_full] catalog link warning: {e}")
 
                         return JSONResponse(content={"success": True, "data": {
                             "sync_id":      str(sync_id),
@@ -1450,87 +1530,43 @@ async def index(_p={'data': {'instance': Any}}):
                             'access_token': '', 'waba_id': '',
                             'phone_number_id': '', 'catalog_id': ''
                         }
+                        cfg.pop('oauth_connected_at', None)
                         d['config'] = cfg
                         row.data = d
                         await db.commit()
                         return JSONResponse(content={"success": True,
-                            "message": "Seller connection records removed."}, status_code=200)
-                        row = await _get_row(db, body)
-                        if not row:
-                            raise Exception("record not found")
-                        meta       = _meta_cfg(row)
-                        token      = meta.get('access_token')
-                        catalog_id = meta.get('catalog_id')
-                        if not token or not catalog_id:
-                            raise Exception("meta.access_token and meta.catalog_id are required")
-
-                        d        = row.data or {}
-                        cfg      = d.get('config', {})
-                        pd_token = body.get('access_token', cfg.get('product_dir_token', ''))
-                        base_url = body.get('base_url', cfg.get('base_url', 'http://localhost:8000'))
-
-                        pd_resp  = await _fetch_products(pd_token, base_url)
-                        products = pd_resp.get('data', {}).get('hits', pd_resp.get('data', []))
-                        if isinstance(products, dict):
-                            products = products.get('hits', [])
-
-                        success_count = 0
-                        fail_count    = 0
-                        failed_items  = []
-
-                        async with httpx.AsyncClient() as client:
-                            for p in products:
-                                doc = p.get('document', p)
-                                try:
-                                    sc, resp_json = await _push_product_to_meta(client, token, catalog_id, doc)
-                                    if sc in (200, 201):
-                                        success_count += 1
-                                    else:
-                                        fail_count += 1
-                                        if len(failed_items) < 20:
-                                            failed_items.append({
-                                                "id":     str(doc.get('id', '')),
-                                                "name":   doc.get('name', ''),
-                                                "reason": str(resp_json),
-                                            })
-                                except Exception as e:
-                                    fail_count += 1
-                                    if len(failed_items) < 20:
-                                        failed_items.append({
-                                            "id":     str(doc.get('id', '')),
-                                            "name":   doc.get('name', ''),
-                                            "reason": str(e),
-                                        })
-
-                        total        = len(products)
-                        sync_health  = "good" if fail_count == 0 else ("partial" if success_count > 0 else "failed")
-                        catalog_log  = {
-                            "catalog_id":     catalog_id,
-                            "last_sync":      datetime.now(timezone.utc).isoformat(),
-                            "total_products": total,
-                            "synced":         success_count,
-                            "failed":         fail_count,
-                            "failed_items":   failed_items,
-                            "sync_health":    sync_health,
-                        }
-                        d = dict(row.data or {})
-                        d['catalog'] = catalog_log
-                        row.data = d
-                        await db.commit()
-
-                        return JSONResponse(content={"success": True, "data": catalog_log}, status_code=200)
+                            "message": "Connection removed."}, status_code=200)
 
                     case 'catalog_status':
                         row = await _get_row(db, body)
                         if not row:
                             raise Exception("record not found")
+                        meta       = _meta_cfg(row)
+                        token      = meta.get('access_token', '')
+                        catalog_id = meta.get('catalog_id', '')
                         d = row.data or {}
-                        return JSONResponse(content={"success": True,
-                                                     "data": d.get('catalog', {
-                                                         "last_sync": None, "total_products": 0,
-                                                         "synced": 0, "failed": 0,
-                                                         "sync_health": "unknown"
-                                                     })}, status_code=200)
+                        product_count = 0
+                        catalog_name  = ''
+                        if token and catalog_id:
+                            try:
+                                async with httpx.AsyncClient() as client:
+                                    r = await client.get(
+                                        f"https://graph.facebook.com/v19.0/{catalog_id}",
+                                        params={"access_token": token, "fields": "id,name,product_count"}
+                                    )
+                                    rj = r.json()
+                                    product_count = rj.get('product_count', 0)
+                                    catalog_name  = rj.get('name', '')
+                            except Exception:
+                                pass
+                        legacy = d.get('catalog', {})
+                        return JSONResponse(content={"success": True, "data": {
+                            **legacy,
+                            "total_products":        product_count,
+                            "total_catalog_products": product_count,
+                            "catalog_name":          catalog_name,
+                            "catalog_id":            catalog_id,
+                        }}, status_code=200)
 
                     # ── Webhook event ──────────────────────────────────────
 
