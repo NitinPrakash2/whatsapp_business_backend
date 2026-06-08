@@ -258,6 +258,89 @@ def index(_p={}):
 
 
 
+    #============DASHBOARD (WhatsApp CRM)==========# [START]
+    # All routes hit the 701 utility via a lightweight internal helper.
+    # They are PUBLIC (no JWT) so the frontend dashboard can call them directly.
+    # Route prefix: /api/wa/
+
+    async def _wa_call(project: str, instance: str, typ: str, body: dict, db):
+        """Internal helper: build a fake request and dispatch to the 701 utility."""
+        from starlette.datastructures import QueryParams
+        from src.shared.utility.index import index as utility_index
+        from src.shared.utility.u.fake_req_obj.index import fake_req_obj
+        req = fake_req_obj(
+            method="POST", url="",
+            headers={"content-type": "application/json"},
+            query_params={"typ": typ},
+            path_params={},
+            json_data=body,
+            state={},
+        )
+        i, _, __, ___, ____ = await utility_index({'data': {}})
+        # resolve the instance so engine is initialised
+        from sqlalchemy.future import select
+        from sqlalchemy.orm import joinedload
+        from src.database.entity.instance import Instance
+        from src.database.entity.project import Project
+        result = await db.execute(
+            select(Instance)
+            .join(Project, Instance.project_id == Project.id)
+            .where(Instance.name == instance, Project.name == project)
+            .options(joinedload(Instance.project), joinedload(Instance.utility))
+        )
+        inst = result.scalar_one_or_none()
+        if not inst:
+            return JSONResponse(content={"success": False, "message": "instance not found"}, status_code=404)
+        from src.shared.util.include_file.index import include_file
+        lib_name, _lib_ = include_file(
+            f"src/shared/utility/l/{inst.utility_id}/index.py", lambda n, m: ()
+        )[0]
+        fn_i, _, __, ___, ____ = await _lib_.index({'data': {'instance': inst}})
+        return await fn_i(req)
+
+    @router.get("/api/wa/{project}/{instance}/analytics")
+    async def wa_analytics(project: str, instance: str, db=Depends(get_db)):
+        return await _wa_call(project, instance, "analytics", {}, db)
+
+    @router.get("/api/wa/{project}/{instance}/customers")
+    async def wa_customers(
+        project: str, instance: str,
+        limit: int = 50, offset: int = 0,
+        db=Depends(get_db)
+    ):
+        return await _wa_call(project, instance, "customers", {"limit": limit, "offset": offset}, db)
+
+    @router.get("/api/wa/{project}/{instance}/customer/{phone}")
+    async def wa_customer_detail(project: str, instance: str, phone: str, db=Depends(get_db)):
+        return await _wa_call(project, instance, "customer_detail", {"phone": phone}, db)
+
+    @router.get("/api/wa/{project}/{instance}/messages")
+    async def wa_messages(project: str, instance: str, limit: int = 20, db=Depends(get_db)):
+        return await _wa_call(project, instance, "latest_messages", {"limit": limit}, db)
+
+    @router.get("/api/wa/{project}/{instance}/business-profile")
+    async def wa_get_profile(project: str, instance: str, db=Depends(get_db)):
+        return await _wa_call(project, instance, "get_profile", {}, db)
+
+    @router.post("/api/wa/{project}/{instance}/business-profile")
+    async def wa_save_profile(request: Request, project: str, instance: str, db=Depends(get_db)):
+        body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+        return await _wa_call(project, instance, "save_profile", body, db)
+
+    @router.get("/api/wa/{project}/{instance}/meta-config")
+    async def wa_get_meta_config(project: str, instance: str, db=Depends(get_db)):
+        return await _wa_call(project, instance, "get_meta_config", {}, db)
+
+    @router.post("/api/wa/{project}/{instance}/meta-config")
+    async def wa_save_meta_config(request: Request, project: str, instance: str, db=Depends(get_db)):
+        body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+        return await _wa_call(project, instance, "meta_config_save", body, db)
+
+    #============DASHBOARD (WhatsApp CRM)==========# [END]
+
+
+
+
 
 
 

@@ -1,14 +1,14 @@
 from typing import Any
 from fastapi import Request
 from fastapi.responses import JSONResponse, PlainTextResponse
-from sqlalchemy import Column, String, Text, DateTime
+from sqlalchemy import Column, String, Text, DateTime, Integer, func as sa_func
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.future import select
 import uuid
 import httpx
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from src.shared.utility.u.fake_req_obj.index import fake_req_obj
 
 
@@ -32,6 +32,70 @@ class WhatsappLog(Base):
     wa_msg_id   = Column(String(100), nullable=True)   # Meta message id for status tracking
     payload     = Column(JSONB, nullable=True)
     created_at  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+# ── New CRM tables ─────────────────────────────────────────────────────────
+
+class WhatsappMessage(Base):
+    """Structured message store (req 1)"""
+    __tablename__ = "whatsapp_messages"
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    wa_id         = Column(String(100), nullable=True, index=True)   # Meta message id
+    phone_number  = Column(String(50), nullable=False, index=True)
+    customer_name = Column(String(200), nullable=True)
+    message_text  = Column(Text, nullable=True)
+    message_type  = Column(String(30), nullable=True, default="text")  # text/interactive/image/…
+    direction     = Column(String(10), nullable=False)                 # incoming/outgoing
+    timestamp     = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+class WhatsappCustomer(Base):
+    """Auto-managed customer CRM (req 2)"""
+    __tablename__ = "whatsapp_customers"
+    id             = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    wa_id          = Column(String(100), nullable=True)
+    phone_number   = Column(String(50), nullable=False, unique=True, index=True)
+    name           = Column(String(200), nullable=True)
+    first_seen     = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    last_seen      = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    total_messages = Column(Integer, default=0)
+
+class WhatsappProductRequest(Base):
+    """Tracks every product match served via webhook — powers product_analytics"""
+    __tablename__ = "whatsapp_product_requests"
+    id           = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    business_id  = Column(String(155), nullable=True, index=True)
+    phone_number = Column(String(50), nullable=True, index=True)
+    product_name = Column(String(300), nullable=False, index=True)
+    query_text   = Column(Text, nullable=True)   # original message that triggered this
+    created_at   = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+# ── SaaS Catalog Sync tables ───────────────────────────────────────────────
+
+class CatalogSyncHistory(Base):
+    """One row per full sync run per seller."""
+    __tablename__ = "catalog_sync_history"
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    business_id   = Column(String(155), nullable=False, index=True)  # whatsapp_business.id
+    catalog_id    = Column(String(155), nullable=True)
+    status        = Column(String(20), nullable=False, default="running")  # running/completed/failed
+    total         = Column(Integer, default=0)
+    synced        = Column(Integer, default=0)
+    failed        = Column(Integer, default=0)
+    started_at    = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    completed_at  = Column(DateTime(timezone=True), nullable=True)
+    trigger       = Column(String(30), nullable=True, default="manual")  # manual/scheduled/api
+
+class CatalogSyncLog(Base):
+    """One row per product per sync run."""
+    __tablename__ = "catalog_sync_log"
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    sync_id       = Column(UUID(as_uuid=True), nullable=False, index=True)  # → CatalogSyncHistory.id
+    business_id   = Column(String(155), nullable=False, index=True)
+    product_id    = Column(String(300), nullable=True)
+    product_name  = Column(String(300), nullable=True)
+    status        = Column(String(20), nullable=False)   # synced/failed/skipped
+    error         = Column(Text, nullable=True)
+    meta_response = Column(JSONB, nullable=True)
+    created_at    = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 async def index(_p={'data': {'instance': Any}}):
@@ -180,24 +244,183 @@ async def index(_p={'data': {'instance': Any}}):
             }
         })
 
+    # ── SaaS Catalog helpers ────────────────────────────────────────────────
+
+    def _normalize_product(doc: dict) -> dict:
+        """Convert product_dir format → Meta Catalog API payload."""
+        price_raw = doc.get('variant_mrp') or doc.get('variant_prices') or doc.get('price', 0)
+        if isinstance(price_raw, list):
+            price_raw = price_raw[0] if price_raw else 0
+        try:
+            price_cents = int(float(str(price_raw).replace(',', '').strip()) * 100)
+        except Exception:
+            price_cents = 0
+        retailer_id = str(doc.get('id', doc.get('slug', '')))
+        name        = str(doc.get('title', doc.get('name', '')))[:100]
+        description = str(doc.get('description', name))[:200] or name
+        # extract image from metadata.color[].image[] — join split URL parts
+        image_url = ''
+        metadata = doc.get('metadata', {})
+        colors = metadata.get('color', metadata.get('colors', []))
+        for color in colors:
+            images = color.get('image', [])
+            # collect all url parts and try to build a complete URL
+            parts = [img.get('url', '') if isinstance(img, dict) else str(img) for img in images]
+            # find a part that starts with https:// and a part ending with image extension
+            base = next((p for p in parts if p.startswith('https://')), '')
+            ext  = next((p for p in parts if any(p.endswith(e) for e in ['.jpg', '.jpeg', '.png', '.webp'])), '')
+            if base and ext:
+                image_url = base + '/' + ext.lstrip('/')
+                break
+            elif base and '.' in base.split('/')[-1]:
+                image_url = base
+                break
+        # fallback to direct fields
+        if not image_url:
+            for img_key in ['image_url', 'image', 'thumbnail', 'photo']:
+                val = doc.get(img_key, '')
+                if isinstance(val, list) and val:
+                    val = val[0]
+                if isinstance(val, str) and val.startswith('https://'):
+                    image_url = val
+                    break
+        # last fallback
+        if not image_url:
+            image_url = 'https://placehold.co/400x400/png'
+        product_url = doc.get('url', metadata.get('url', 'https://onamoda.in/'))
+        return {
+            "retailer_id":  retailer_id,
+            "name":         name,
+            "description":  description,
+            "price":        price_cents,
+            "currency":     doc.get('currency', metadata.get('variant', [{}])[0].get('currency', 'INR') if metadata.get('variant') else 'INR'),
+            "availability": "in stock",
+            "url":          product_url,
+            "image_url":    image_url,
+        }
+
+    async def _meta_push_one(client: httpx.AsyncClient, token: str, catalog_id: str, payload: dict):
+        """POST one product to Meta Catalog. Returns (status_code, json)."""
+        r = await client.post(
+            f"https://graph.facebook.com/v19.0/{catalog_id}/products",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=15,
+        )
+        return r.status_code, r.json()
+
+    async def _meta_delete_one(client: httpx.AsyncClient, token: str, catalog_id: str, retailer_id: str):
+        """DELETE one product from Meta Catalog by retailer_id."""
+        r = await client.delete(
+            f"https://graph.facebook.com/v19.0/{catalog_id}/products",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"retailer_id": retailer_id},
+            timeout=15,
+        )
+        return r.status_code, r.json()
+
+    async def _meta_discover_assets(token: str) -> dict:
+        """
+        Auto-discover WABA, phone numbers and catalogs from a token.
+        Used by meta_connect — lays the groundwork for Embedded Signup.
+        Returns dict with waba_list, phone_list, catalog_list.
+        """
+        result = {"waba_list": [], "phone_list": [], "catalog_list": [], "token_info": {}}
+        async with httpx.AsyncClient() as client:
+            # token identity
+            r = await client.get("https://graph.facebook.com/v19.0/me",
+                                  params={"access_token": token})
+            result["token_info"] = r.json()
+            user_id = result["token_info"].get("id", "")
+
+            # WABAs the token has access to
+            r2 = await client.get(
+                f"https://graph.facebook.com/v19.0/{user_id}/businesses",
+                params={"access_token": token, "fields": "id,name,whatsapp_business_accounts"}
+            )
+            businesses = r2.json().get("data", [])
+            for biz in businesses:
+                for waba in biz.get("whatsapp_business_accounts", {}).get("data", []):
+                    waba_id = waba.get("id")
+                    result["waba_list"].append({"id": waba_id, "name": waba.get("name", "")})
+
+                    # phone numbers under this WABA
+                    r3 = await client.get(
+                        f"https://graph.facebook.com/v19.0/{waba_id}/phone_numbers",
+                        params={"access_token": token, "fields": "id,display_phone_number,verified_name"}
+                    )
+                    for ph in r3.json().get("data", []):
+                        result["phone_list"].append({
+                            "id":           ph.get("id"),
+                            "phone":        ph.get("display_phone_number"),
+                            "display_name": ph.get("verified_name"),
+                            "waba_id":      waba_id,
+                        })
+
+                # catalogs under this business
+                r4 = await client.get(
+                    f"https://graph.facebook.com/v19.0/{biz.get('id')}/owned_product_catalogs",
+                    params={"access_token": token, "fields": "id,name"}
+                )
+                for cat in r4.json().get("data", []):
+                    result["catalog_list"].append({"id": cat.get("id"), "name": cat.get("name", "")})
+
+        return result
+
     # ── Product dir helper ──────────────────────────────────────────────────
 
     async def _fetch_products(token: str, base_url: str, q: str = "*", per_page: int = 250):
         print(f"[fetch_products] calling base_url={base_url}")
         async with httpx.AsyncClient() as client:
+            # try public route first (no JWT needed)
             resp = await client.post(
-                f"{base_url}/client/api/i/ona/product_dir?typ=get_product_list",
-                headers={"Authorization": f"Bearer {token}"},
+                f"{base_url}/client-public/api/i/ona/product_dir?typ=get_product_list",
                 json={"q": q, "per_page": per_page, "page": 1},
                 timeout=30
             )
+            if resp.status_code == 404:
+                # fallback to authenticated route
+                resp = await client.post(
+                    f"{base_url}/client/api/i/ona/product_dir?typ=get_product_list",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"q": q, "per_page": per_page, "page": 1},
+                    timeout=30
+                )
         print(f"[fetch_products] status={resp.status_code} body={resp.text[:300]}")
         return resp.json()
 
     # ── Log helper ──────────────────────────────────────────────────────────
 
+    async def _upsert_customer(db, phone: str, name: str = None, wa_id: str = None):
+        """Auto create/update customer record."""
+        result = await db.execute(
+            select(WhatsappCustomer).where(WhatsappCustomer.phone_number == phone)
+        )
+        customer = result.scalar_one_or_none()
+        now = datetime.now(timezone.utc)
+        if customer:
+            customer.last_seen = now
+            customer.total_messages = (customer.total_messages or 0) + 1
+            if name and not customer.name:
+                customer.name = name
+            if wa_id and not customer.wa_id:
+                customer.wa_id = wa_id
+        else:
+            customer = WhatsappCustomer(
+                phone_number=phone,
+                name=name or phone,
+                wa_id=wa_id,
+                first_seen=now,
+                last_seen=now,
+                total_messages=1,
+            )
+            db.add(customer)
+        await db.flush()
+        return customer
+
     async def _log(db, direction: str, from_: str, to_: str, message: str, payload: dict,
-                   business_id: str = None, wa_msg_id: str = None):
+                   business_id: str = None, wa_msg_id: str = None,
+                   message_type: str = "text", customer_name: str = None):
         log = WhatsappLog(
             business_id=business_id,
             direction=direction,
@@ -209,6 +432,21 @@ async def index(_p={'data': {'instance': Any}}):
             msg_status="sent" if direction == "out" else None,
         )
         db.add(log)
+        # write to whatsapp_messages
+        phone = from_ if direction in ('in', 'incoming') else to_
+        msg_direction = "incoming" if direction == 'in' else "outgoing"
+        wa_msg = WhatsappMessage(
+            wa_id=wa_msg_id,
+            phone_number=phone,
+            customer_name=customer_name,
+            message_text=message,
+            message_type=message_type,
+            direction=msg_direction,
+        )
+        db.add(wa_msg)
+        # upsert customer only for real messages (not event logs)
+        if direction in ('in', 'out') and phone:
+            await _upsert_customer(db, phone, customer_name, wa_msg_id)
         await db.flush()
 
     # ── Template variable substitution ─────────────────────────────────────
@@ -273,6 +511,20 @@ async def index(_p={'data': {'instance': Any}}):
 
         text = msg_text.strip().lower()
 
+        async def _track_product_requests(products_shown: list, query: str):
+            """Log each product served to WhatsappProductRequest for analytics."""
+            for p in products_shown:
+                doc  = p.get('document', p)
+                name = doc.get('name', doc.get('title', ''))
+                if name:
+                    db.add(WhatsappProductRequest(
+                        business_id=str(row.id),
+                        phone_number=from_number,
+                        product_name=str(name)[:300],
+                        query_text=query,
+                    ))
+            await db.flush()
+
         # handle product selection from interactive list
         if msg_text.startswith('product:'):
             product_name = msg_text[8:].strip()
@@ -309,6 +561,7 @@ async def index(_p={'data': {'instance': Any}}):
                         reply += f"\U0001f455 *{name}*{price_str}\n"
                     reply += "\nType *products* to browse more."
                     r = await _send_text(token, phone_id, from_number, reply)
+                    await _track_product_requests(products_to_show[:10], product_name)
                 else:
                     r = await _send_text(token, phone_id, from_number, f"No products found for '{product_name}'.\nType *products* to browse all.")
                 await _log(db, 'out', phone_id, from_number, f"product detail: {product_name}", r, str(row.id))
@@ -338,6 +591,7 @@ async def index(_p={'data': {'instance': Any}}):
                 print(f"[products] count={len(products)} sample={str(products[0])[:100] if products else 'empty'}")
                 r = await _send_product_list(token, phone_id, from_number, products, product_template)
                 print(f"[products] send result={r}")
+                await _track_product_requests(products[:10], text)
                 await _log(db, 'out', phone_id, from_number, f"Sent {len(products)} products", r, str(row.id))
             except Exception as e:
                 import traceback
@@ -392,10 +646,12 @@ async def index(_p={'data': {'instance': Any}}):
                             "availability": "In Stock",
                         })
                         r = await _send_text(token, phone_id, from_number, reply)
+                        await _track_product_requests(products[:5], msg_text.strip())
                         await _log(db, 'out', phone_id, from_number, reply, r, str(row.id))
                     else:
                         r = await _send_product_list(token, phone_id, from_number, products,
                                                      f"Results for '{msg_text.strip()}'")
+                        await _track_product_requests(products[:10], msg_text.strip())
                         await _log(db, 'out', phone_id, from_number, f"Search: {msg_text}", r, str(row.id))
                 else:
                     r = await _send_text(token, phone_id, from_number, default_reply_msg)
@@ -465,9 +721,9 @@ async def index(_p={'data': {'instance': Any}}):
 
                     case 'update':
                         # 1. save to DB
-                        row = await _get_row_by_user(db, body['user_id'])
+                        row = await _get_row(db, body)
                         if not row:
-                            row = WhatsappBusiness(user_id=body['user_id'], data=body.get('data', {}))
+                            row = WhatsappBusiness(user_id=body.get('user_id', str(uuid.uuid4())), data=body.get('data', {}))
                             db.add(row)
                         else:
                             if 'data' in body:
@@ -488,8 +744,6 @@ async def index(_p={'data': {'instance': Any}}):
                                     warning = f"Saved to DB but Meta profile update failed: {meta_resp}"
                             except Exception as e:
                                 warning = f"Saved to DB but Meta profile update failed: {e}"
-                        else:
-                            warning = "Saved to DB. Meta profile not pushed — credentials not configured."
 
                         resp = {"success": True, "data": {"id": str(row.id)}}
                         if warning:
@@ -650,9 +904,400 @@ async def index(_p={'data': {'instance': Any}}):
                         return JSONResponse(content={"success": True, "data": {"meta_response": meta_resp}},
                                             status_code=200)
 
-                    # ── Catalog sync — per-product with health status ───────
+                    # ── meta_connect — auto-discover assets (Embedded Signup ready) ──
 
-                    case 'catalog_sync':
+                    case 'meta_connect':
+                        # Accepts just an access_token, discovers all WABA/phone/catalog
+                        # assets automatically. Saves discovered config to the record.
+                        # This is the foundation for Meta Embedded Signup flow.
+                        row = await _get_row(db, body)
+                        if not row:
+                            raise Exception("record not found — create first")
+                        token = body.get('access_token') or body.get('meta', {}).get('access_token')
+                        if not token:
+                            raise Exception("access_token is required")
+                        try:
+                            assets = await _meta_discover_assets(token)
+                        except Exception as e:
+                            return JSONResponse(content={"success": False,
+                                "message": f"Meta asset discovery failed: {e}",
+                                "data": {}}, status_code=200)
+                        # auto-select first available assets if only one each
+                        auto_waba    = assets["waba_list"][0]["id"]    if len(assets["waba_list"]) == 1    else None
+                        auto_phone   = assets["phone_list"][0]["id"]   if len(assets["phone_list"]) == 1   else None
+                        auto_catalog = assets["catalog_list"][0]["id"] if len(assets["catalog_list"]) == 1 else None
+                        # persist token + any auto-selected IDs
+                        d   = dict(row.data or {})
+                        cfg = dict(d.get('config', {}))
+                        existing_meta = cfg.get('meta', {})
+                        cfg['meta'] = {
+                            **existing_meta,
+                            'access_token':    token,
+                            'waba_id':         auto_waba    or existing_meta.get('waba_id', ''),
+                            'phone_number_id': auto_phone   or existing_meta.get('phone_number_id', ''),
+                            'catalog_id':      auto_catalog or existing_meta.get('catalog_id', ''),
+                        }
+                        d['config'] = cfg
+                        row.data = d
+                        await db.commit()
+                        return JSONResponse(content={"success": True, "data": {
+                            "discovered":   assets,
+                            "auto_selected": {
+                                "waba_id":         auto_waba,
+                                "phone_number_id": auto_phone,
+                                "catalog_id":      auto_catalog,
+                            },
+                            "note": "If multiple assets found, call save_meta_config to set specific IDs."
+                        }}, status_code=200)
+
+                    # ── catalog_validate — validate credentials + catalog access ───────
+
+                    case 'catalog_validate':
+                        row = await _get_row(db, body)
+                        if not row:
+                            raise Exception("record not found")
+                        meta       = _meta_cfg(row)
+                        token      = meta.get('access_token')
+                        catalog_id = meta.get('catalog_id')
+                        waba_id    = meta.get('waba_id')
+                        token_ok = catalog_ok = waba_ok = False
+                        async with httpx.AsyncClient() as client:
+                            r = await client.get("https://graph.facebook.com/v19.0/me",
+                                                  params={"access_token": token})
+                            token_ok = "id" in r.json()
+                            if catalog_id:
+                                r2 = await client.get(
+                                    f"https://graph.facebook.com/v19.0/{catalog_id}",
+                                    params={"access_token": token, "fields": "id,name,product_count"}
+                                )
+                                catalog_ok = "id" in r2.json()
+                            if waba_id:
+                                r3 = await client.get(
+                                    f"https://graph.facebook.com/v19.0/{waba_id}",
+                                    params={"access_token": token, "fields": "id,name"}
+                                )
+                                waba_ok = "id" in r3.json()
+                        all_ok = token_ok and catalog_ok and waba_ok
+                        return JSONResponse(content={"success": True, "data": {
+                            "meta_connected":     token_ok,
+                            "catalog_accessible": catalog_ok,
+                            "waba_connected":     waba_ok,
+                            "permissions_valid":  all_ok,
+                            "valid":              all_ok,
+                        }}, status_code=200)
+
+                    # ── catalog_details — catalog info + product count from Meta ───────
+
+                    case 'catalog_details':
+                        row = await _get_row(db, body)
+                        if not row:
+                            raise Exception("record not found")
+                        meta       = _meta_cfg(row)
+                        token      = meta.get('access_token')
+                        catalog_id = meta.get('catalog_id')
+                        phone_number_id = meta.get('phone_number_id', '')
+                        if not token or not catalog_id:
+                            raise Exception("access_token and catalog_id required")
+                        async with httpx.AsyncClient() as client:
+                            r = await client.get(
+                                f"https://graph.facebook.com/v19.0/{catalog_id}",
+                                params={"access_token": token,
+                                        "fields": "id,name,product_count,vertical,da_display_settings"}
+                            )
+                            # fetch phone number display
+                            phone_display = ''
+                            if phone_number_id:
+                                rp = await client.get(
+                                    f"https://graph.facebook.com/v19.0/{phone_number_id}",
+                                    params={"access_token": token, "fields": "display_phone_number"}
+                                )
+                                phone_display = rp.json().get('display_phone_number', '')
+                        d = r.json()
+                        if "error" in d:
+                            raise Exception(d["error"].get("message", "Meta API error"))
+                        # get last sync info
+                        run = (await db.execute(
+                            select(CatalogSyncHistory)
+                            .where(CatalogSyncHistory.business_id == str(row.id))
+                            .order_by(CatalogSyncHistory.started_at.desc())
+                            .limit(1)
+                        )).scalar_one_or_none()
+                        return JSONResponse(content={"success": True, "data": {
+                            "meta_connected":        bool(token),
+                            "business_name":         (row.data or {}).get('profile', {}).get('title', ''),
+                            "catalog_name":          d.get('name', ''),
+                            "catalog_id":            d.get('id', catalog_id),
+                            "phone_number":          phone_display,
+                            "total_catalog_products": d.get('product_count', 0),
+                            "last_updated":          run.completed_at.isoformat() if run and run.completed_at else None,
+                        }}, status_code=200)
+
+                    # ── catalog_sync_full — full sync with proper history tracking ─────
+
+                    case 'catalog_sync_full':
+                        row = await _get_row(db, body)
+                        if not row:
+                            raise Exception("record not found")
+                        meta       = _meta_cfg(row)
+                        token      = meta.get('access_token')
+                        catalog_id = meta.get('catalog_id')
+                        if not token or not catalog_id:
+                            raise Exception("access_token and catalog_id are required")
+
+                        d               = row.data or {}
+                        cfg             = d.get('config', {})
+                        pd_token        = cfg.get('product_dir_token', '')
+                        base_url        = cfg.get('base_url', 'https://fastapi.dryutil.1mn.io')
+                        trigger         = body.get('trigger', 'manual')
+                        business_id_str = str(row.id)
+
+                        # fetch products first — before opening sync session
+                        try:
+                            pd_resp  = await _fetch_products(pd_token, base_url, per_page=250)
+                            products = pd_resp.get('data', {}).get('products',
+                                       pd_resp.get('data', {}).get('hits', []))
+                            if isinstance(products, dict):
+                                products = products.get('hits', products.get('products', []))
+                        except Exception as e:
+                            raise Exception(f"Failed to fetch products: {e}")
+
+                        success_count, fail_count = 0, 0
+                        sync_id    = uuid.uuid4()
+                        started_at = datetime.now(timezone.utc)
+                        completed_at = started_at
+                        final_status = "failed"
+
+                        async with AsyncSession(_engine) as sync_db:
+                            sync_run = CatalogSyncHistory(
+                                id=sync_id,
+                                business_id=business_id_str,
+                                catalog_id=catalog_id,
+                                status="running",
+                                trigger=trigger,
+                                total=len(products),
+                            )
+                            sync_db.add(sync_run)
+                            await sync_db.flush()
+
+                            async with httpx.AsyncClient() as client:
+                                for p in products:
+                                    doc     = p.get('document', p)
+                                    payload = _normalize_product(doc)
+                                    pid     = payload["retailer_id"]
+                                    pname   = payload["name"]
+                                    try:
+                                        sc, resp_json = await _meta_push_one(client, token, catalog_id, payload)
+                                        ok = sc in (200, 201)
+                                        sync_db.add(CatalogSyncLog(
+                                            sync_id=sync_id,
+                                            business_id=business_id_str,
+                                            product_id=pid,
+                                            product_name=pname,
+                                            status="synced" if ok else "failed",
+                                            error=None if ok else str(resp_json),
+                                            meta_response=resp_json,
+                                        ))
+                                        if ok:
+                                            success_count += 1
+                                        else:
+                                            fail_count += 1
+                                    except Exception as e:
+                                        fail_count += 1
+                                        sync_db.add(CatalogSyncLog(
+                                            sync_id=sync_id,
+                                            business_id=business_id_str,
+                                            product_id=pid,
+                                            product_name=pname,
+                                            status="failed",
+                                            error=str(e),
+                                        ))
+
+                            completed_at = datetime.now(timezone.utc)
+                            final_status = "completed" if fail_count == 0 else ("partial" if success_count > 0 else "failed")
+                            sync_run.synced       = success_count
+                            sync_run.failed       = fail_count
+                            sync_run.status       = final_status
+                            sync_run.completed_at = completed_at
+                            await sync_db.commit()
+
+                        # update legacy catalog key using main db session
+                        from sqlalchemy import text as sa_text
+                        catalog_json = f'{{"last_sync": "{completed_at.isoformat()}", "total_products": {len(products)}, "synced": {success_count}, "failed": {fail_count}, "sync_health": "{final_status}"}}'
+                        await db.execute(sa_text(
+                            f"UPDATE whatsapp_business SET data = jsonb_set(data, '{{catalog}}', '{catalog_json}'::jsonb) WHERE id = '{business_id_str}'::uuid"
+                        ))
+                        await db.commit()
+
+                        return JSONResponse(content={"success": True, "data": {
+                            "sync_id":      str(sync_id),
+                            "status":       final_status,
+                            "total":        len(products),
+                            "synced":       success_count,
+                            "failed":       fail_count,
+                            "started_at":   started_at.isoformat(),
+                            "completed_at": completed_at.isoformat(),
+                        }}, status_code=200)
+
+                    # ── catalog_sync_product — sync a single product by id ────────────
+
+                    case 'catalog_sync_product':
+                        row = await _get_row(db, body)
+                        if not row:
+                            raise Exception("record not found")
+                        meta       = _meta_cfg(row)
+                        token      = meta.get('access_token')
+                        catalog_id = meta.get('catalog_id')
+                        if not token or not catalog_id:
+                            raise Exception("access_token and catalog_id are required")
+                        product = body.get('product')
+                        if not product:
+                            raise Exception("product object is required")
+                        payload = _normalize_product(product)
+                        async with httpx.AsyncClient() as client:
+                            sc, resp_json = await _meta_push_one(client, token, catalog_id, payload)
+                        ok = sc in (200, 201)
+                        return JSONResponse(content={"success": ok, "data": {
+                            "retailer_id":   payload["retailer_id"],
+                            "meta_response": resp_json,
+                            "status":        "synced" if ok else "failed",
+                        }}, status_code=200)
+
+                    # ── catalog_delete_product — remove product from Meta catalog ──────
+
+                    case 'catalog_delete_product':
+                        row = await _get_row(db, body)
+                        if not row:
+                            raise Exception("record not found")
+                        meta       = _meta_cfg(row)
+                        token      = meta.get('access_token')
+                        catalog_id = meta.get('catalog_id')
+                        if not token or not catalog_id:
+                            raise Exception("access_token and catalog_id are required")
+                        retailer_id = body.get('retailer_id') or body.get('product_id')
+                        if not retailer_id:
+                            raise Exception("retailer_id is required")
+                        async with httpx.AsyncClient() as client:
+                            sc, resp_json = await _meta_delete_one(client, token, catalog_id, retailer_id)
+                        return JSONResponse(content={"success": sc in (200, 201, 204), "data": {
+                            "retailer_id":   retailer_id,
+                            "meta_response": resp_json,
+                        }}, status_code=200)
+
+                    # ── catalog_sync_history — list sync runs for a seller ────────────
+
+                    case 'catalog_sync_history':
+                        row = await _get_row(db, body)
+                        if not row:
+                            raise Exception("record not found")
+                        limit  = int(body.get('limit', 20))
+                        offset = int(body.get('offset', 0))
+                        runs = (await db.execute(
+                            select(CatalogSyncHistory)
+                            .where(CatalogSyncHistory.business_id == str(row.id))
+                            .order_by(CatalogSyncHistory.started_at.desc())
+                            .limit(limit).offset(offset)
+                        )).scalars().all()
+                        return JSONResponse(content={"success": True, "data": {
+                            "history": [{
+                                "id":             str(r.id),
+                                "date":           r.started_at.isoformat() if r.started_at else None,
+                                "catalog_id":     r.catalog_id,
+                                "status":         r.status,
+                                "total_products": r.total,
+                                "synced":         r.synced,
+                                "failed":         r.failed,
+                                "trigger":        r.trigger,
+                                "started_at":     r.started_at.isoformat() if r.started_at else None,
+                                "completed_at":   r.completed_at.isoformat() if r.completed_at else None,
+                            } for r in runs],
+                        }}, status_code=200)
+
+                    # ── catalog_sync_status — latest sync run status ──────────────────
+
+                    case 'catalog_sync_status':
+                        row = await _get_row(db, body)
+                        if not row:
+                            raise Exception("record not found")
+                        run = (await db.execute(
+                            select(CatalogSyncHistory)
+                            .where(CatalogSyncHistory.business_id == str(row.id))
+                            .order_by(CatalogSyncHistory.started_at.desc())
+                            .limit(1)
+                        )).scalar_one_or_none()
+                        if not run:
+                            return JSONResponse(content={"success": True, "data": {
+                                "last_sync_status": "never_synced",
+                                "last_sync":        None,
+                                "sync_health":      "unknown",
+                                "status":           "never_synced",
+                            }}, status_code=200)
+                        health = "good" if run.failed == 0 else ("partial" if run.synced > 0 else "failed")
+                        return JSONResponse(content={"success": True, "data": {
+                            "sync_id":          str(run.id),
+                            "last_sync_status": run.status,
+                            "status":           run.status,
+                            "last_sync":        run.completed_at.isoformat() if run.completed_at else None,
+                            "sync_health":      health,
+                            "total":            run.total,
+                            "synced":           run.synced,
+                            "failed":           run.failed,
+                            "started_at":       run.started_at.isoformat() if run.started_at else None,
+                        }}, status_code=200)
+
+                    # ── catalog_sync_errors — failed products for a sync run ──────────
+
+                    case 'catalog_sync_errors':
+                        sync_id = body.get('sync_id')
+                        row     = await _get_row(db, body)
+                        if not row:
+                            raise Exception("record not found")
+                        if not sync_id:
+                            run = (await db.execute(
+                                select(CatalogSyncHistory)
+                                .where(CatalogSyncHistory.business_id == str(row.id))
+                                .order_by(CatalogSyncHistory.started_at.desc())
+                                .limit(1)
+                            )).scalar_one_or_none()
+                            if not run:
+                                return JSONResponse(content={"success": True,
+                                    "data": {"errors": [], "total_errors": 0}}, status_code=200)
+                            sync_id = str(run.id)
+                        logs = (await db.execute(
+                            select(CatalogSyncLog)
+                            .where(
+                                CatalogSyncLog.sync_id == uuid.UUID(sync_id),
+                                CatalogSyncLog.status == "failed"
+                            )
+                            .order_by(CatalogSyncLog.created_at.asc())
+                        )).scalars().all()
+                        return JSONResponse(content={"success": True, "data": {
+                            "sync_id":      sync_id,
+                            "total_errors": len(logs),
+                            "errors": [{
+                                "id":           str(l.id),
+                                "product_id":   l.product_id,
+                                "name":         l.product_name,
+                                "reason":       l.error,
+                            } for l in logs],
+                        }}, status_code=200)
+
+                    # ── meta_disconnect — clear meta credentials ──────────────────────
+
+                    case 'meta_disconnect':
+                        row = await _get_row(db, body)
+                        if not row:
+                            raise Exception("record not found")
+                        d   = dict(row.data or {})
+                        cfg = dict(d.get('config', {}))
+                        cfg['meta'] = {
+                            'access_token': '', 'waba_id': '',
+                            'phone_number_id': '', 'catalog_id': ''
+                        }
+                        d['config'] = cfg
+                        row.data = d
+                        await db.commit()
+                        return JSONResponse(content={"success": True,
+                            "message": "Seller connection records removed."}, status_code=200)
                         row = await _get_row(db, body)
                         if not row:
                             raise Exception("record not found")
@@ -830,27 +1475,43 @@ async def index(_p={'data': {'instance': Any}}):
                             .order_by(WhatsappLog.created_at.desc())
                         )
                         logs = result.scalars().all()
+                        # pull customer names from whatsapp_customers for enrichment
+                        all_phones = list({l.from_ for l in logs if l.from_})
+                        cust_map = {}
+                        if all_phones:
+                            cust_rows = (await db.execute(
+                                select(WhatsappCustomer)
+                                .where(WhatsappCustomer.phone_number.in_(all_phones))
+                            )).scalars().all()
+                            cust_map = {c.phone_number: c.name for c in cust_rows}
                         contacts_map = {}
                         for l in logs:
                             phone = l.from_ or ''
                             if phone not in contacts_map:
                                 contacts_map[phone] = {
                                     "phone":        phone,
-                                    "name":         phone,
+                                    "name":         cust_map.get(phone, phone),
                                     "last_message": l.message,
                                     "last_seen":    l.created_at.isoformat() if l.created_at else None,
                                     "count":        0,
                                 }
                             contacts_map[phone]['count'] += 1
-                        contacts = list(contacts_map.values())
-                        r_in  = await db.execute(select(WhatsappLog).where(WhatsappLog.direction == 'in'))
-                        r_out = await db.execute(select(WhatsappLog).where(WhatsappLog.direction == 'out'))
+                        contacts = sorted(
+                            contacts_map.values(),
+                            key=lambda x: x['count'],
+                            reverse=True
+                        )
+                        total_received = sum(c['count'] for c in contacts)
+                        total_sent = (await db.execute(
+                            select(sa_func.count(WhatsappLog.id))
+                            .where(WhatsappLog.direction == 'out')
+                        )).scalar()
                         return JSONResponse(content={"success": True, "data": {
                             "contacts": contacts,
                             "stats": {
                                 "total_contacts": len(contacts),
-                                "total_received": len(r_in.scalars().all()),
-                                "total_sent":     len(r_out.scalars().all()),
+                                "total_received": total_received,
+                                "total_sent":     total_sent,
                             },
                         }}, status_code=200)
 
@@ -913,6 +1574,303 @@ async def index(_p={'data': {'instance': Any}}):
                         await db.commit()
                         return JSONResponse(content={"success": True, "data": {}}, status_code=200)
 
+                    # ── Analytics (req 3) ───────────────────────────────────
+
+                    case 'analytics':
+                        from sqlalchemy import cast, Date as SADate
+                        now      = datetime.now(timezone.utc)
+                        today    = now.date()
+                        week_ago = now - timedelta(days=7)
+                        month_ago = now - timedelta(days=30)
+
+                        total_msgs_r   = await db.execute(sa_func.count(WhatsappMessage.id).select())
+                        total_msgs     = (await db.execute(select(sa_func.count(WhatsappMessage.id)))).scalar()
+                        total_cust     = (await db.execute(select(sa_func.count(WhatsappCustomer.id)))).scalar()
+                        msgs_today     = (await db.execute(
+                            select(sa_func.count(WhatsappMessage.id))
+                            .where(cast(WhatsappMessage.timestamp, SADate) == today)
+                        )).scalar()
+                        msgs_week      = (await db.execute(
+                            select(sa_func.count(WhatsappMessage.id))
+                            .where(WhatsappMessage.timestamp >= week_ago)
+                        )).scalar()
+                        msgs_month     = (await db.execute(
+                            select(sa_func.count(WhatsappMessage.id))
+                            .where(WhatsappMessage.timestamp >= month_ago)
+                        )).scalar()
+
+                        # top customers by message count
+                        top_cust_rows = (await db.execute(
+                            select(WhatsappCustomer)
+                            .order_by(WhatsappCustomer.total_messages.desc())
+                            .limit(10)
+                        )).scalars().all()
+                        top_customers = [{
+                            "id": str(c.id), "phone": c.phone_number,
+                            "name": c.name, "total_messages": c.total_messages,
+                            "last_seen": c.last_seen.isoformat() if c.last_seen else None,
+                        } for c in top_cust_rows]
+
+                        # most requested products (messages containing product keywords)
+                        prod_rows = (await db.execute(
+                            select(WhatsappMessage.message_text, sa_func.count(WhatsappMessage.id).label('cnt'))
+                            .where(WhatsappMessage.direction == 'incoming')
+                            .where(WhatsappMessage.message_text.ilike('%product%') |
+                                   WhatsappMessage.message_text.ilike('%catalog%') |
+                                   WhatsappMessage.message_text.ilike('%price%'))
+                            .group_by(WhatsappMessage.message_text)
+                            .order_by(sa_func.count(WhatsappMessage.id).desc())
+                            .limit(10)
+                        )).all()
+                        most_requested = [{"query": r[0], "count": r[1]} for r in prod_rows]
+
+                        # daily message counts (last 30 days)
+                        from sqlalchemy import text as sa_text
+                        daily_rows = (await db.execute(sa_text(
+                            "SELECT DATE(timestamp) as day, COUNT(*) as cnt "
+                            "FROM whatsapp_messages "
+                            "WHERE timestamp >= NOW() - INTERVAL '30 days' "
+                            "GROUP BY day ORDER BY day"
+                        ))).all()
+                        daily_counts = [{"date": str(r[0]), "count": r[1]} for r in daily_rows]
+
+                        # customer growth (daily new customers last 30 days)
+                        growth_rows = (await db.execute(sa_text(
+                            "SELECT DATE(first_seen) as day, COUNT(*) as cnt "
+                            "FROM whatsapp_customers "
+                            "WHERE first_seen >= NOW() - INTERVAL '30 days' "
+                            "GROUP BY day ORDER BY day"
+                        ))).all()
+                        customer_growth = [{"date": str(r[0]), "count": r[1]} for r in growth_rows]
+
+                        return JSONResponse(content={"success": True, "data": {
+                            "total_messages":   total_msgs,
+                            "total_customers":  total_cust,
+                            "messages_today":   msgs_today,
+                            "messages_week":    msgs_week,
+                            "messages_month":   msgs_month,
+                            "top_customers":    top_customers,
+                            "most_requested_products": most_requested,
+                            "daily_message_counts":    daily_counts,
+                            "customer_growth":         customer_growth,
+                        }}, status_code=200)
+
+                    # ── Customer list (req 4) ───────────────────────────────
+
+                    case 'customers':
+                        limit  = int(body.get('limit', 50))
+                        offset = int(body.get('offset', 0))
+                        rows   = (await db.execute(
+                            select(WhatsappCustomer)
+                            .order_by(WhatsappCustomer.last_seen.desc())
+                            .limit(limit).offset(offset)
+                        )).scalars().all()
+                        total = (await db.execute(select(sa_func.count(WhatsappCustomer.id)))).scalar()
+                        return JSONResponse(content={"success": True, "data": {
+                            "total": total,
+                            "customers": [{
+                                "id":             str(c.id),
+                                "wa_id":          c.wa_id,
+                                "phone_number":   c.phone_number,
+                                "name":           c.name,
+                                "first_seen":     c.first_seen.isoformat() if c.first_seen else None,
+                                "last_seen":      c.last_seen.isoformat() if c.last_seen else None,
+                                "total_messages": c.total_messages,
+                            } for c in rows],
+                        }}, status_code=200)
+
+                    # ── Customer detail (req 4) ─────────────────────────────
+
+                    case 'customer_detail':
+                        phone = body.get('phone') or body.get('phone_number')
+                        cid   = body.get('customer_id')
+                        if cid:
+                            cust = (await db.execute(
+                                select(WhatsappCustomer).where(WhatsappCustomer.id == uuid.UUID(cid))
+                            )).scalar_one_or_none()
+                        elif phone:
+                            cust = (await db.execute(
+                                select(WhatsappCustomer).where(WhatsappCustomer.phone_number == phone)
+                            )).scalar_one_or_none()
+                        else:
+                            raise Exception("phone or customer_id required")
+                        if not cust:
+                            raise Exception("customer not found")
+                        msgs = (await db.execute(
+                            select(WhatsappMessage)
+                            .where(WhatsappMessage.phone_number == cust.phone_number)
+                            .order_by(WhatsappMessage.timestamp.asc())
+                        )).scalars().all()
+                        return JSONResponse(content={"success": True, "data": {
+                            "customer": {
+                                "id": str(cust.id), "wa_id": cust.wa_id,
+                                "phone_number": cust.phone_number, "name": cust.name,
+                                "first_seen": cust.first_seen.isoformat() if cust.first_seen else None,
+                                "last_seen":  cust.last_seen.isoformat() if cust.last_seen else None,
+                                "total_messages": cust.total_messages,
+                            },
+                            "messages": [{
+                                "id":          str(m.id),
+                                "wa_id":       m.wa_id,
+                                "text":        m.message_text,
+                                "type":        m.message_type,
+                                "direction":   m.direction,
+                                "timestamp":   m.timestamp.isoformat() if m.timestamp else None,
+                            } for m in msgs],
+                        }}, status_code=200)
+
+                    # ── Latest messages (req 4) ─────────────────────────────
+
+                    case 'latest_messages':
+                        limit = int(body.get('limit', 20))
+                        rows  = (await db.execute(
+                            select(WhatsappMessage)
+                            .order_by(WhatsappMessage.timestamp.desc())
+                            .limit(limit)
+                        )).scalars().all()
+                        return JSONResponse(content={"success": True, "data": [{
+                            "id":           str(m.id),
+                            "wa_id":        m.wa_id,
+                            "phone_number": m.phone_number,
+                            "customer_name":m.customer_name,
+                            "text":         m.message_text,
+                            "type":         m.message_type,
+                            "direction":    m.direction,
+                            "timestamp":    m.timestamp.isoformat() if m.timestamp else None,
+                        } for m in rows]}, status_code=200)
+
+                    # ── message_log — all messages paginated (unblocks FragMessages) ──
+
+                    case 'message_log':
+                        limit  = int(body.get('limit', 100))
+                        offset = int(body.get('offset', 0))
+                        result = await db.execute(
+                            select(WhatsappLog)
+                            .where(WhatsappLog.direction.in_(['in', 'out']))
+                            .order_by(WhatsappLog.created_at.desc())
+                            .limit(limit).offset(offset)
+                        )
+                        logs = result.scalars().all()
+                        return JSONResponse(content={"success": True, "data": [{
+                            "id":         str(l.id),
+                            "direction":  l.direction,
+                            "from":       l.from_,
+                            "to":         l.to_,
+                            "message":    l.message,
+                            "type":       (l.payload or {}).get('type', 'text') if l.payload else 'text',
+                            "created_at": l.created_at.isoformat() if l.created_at else None,
+                            "status":     l.msg_status or "sent",
+                        } for l in logs]}, status_code=200)
+
+                    # ── message_stats — accurate daily chart (unblocks FragAnalytics) ─
+
+                    case 'message_stats':
+                        from sqlalchemy import cast, Date as SADate, text as sa_text
+                        now       = datetime.now(timezone.utc)
+                        today     = now.date()
+                        week_ago  = now - timedelta(days=7)
+                        month_ago = now - timedelta(days=30)
+                        msgs_today = (await db.execute(
+                            select(sa_func.count(WhatsappLog.id))
+                            .where(cast(WhatsappLog.created_at, SADate) == today)
+                            .where(WhatsappLog.direction != 'event')
+                        )).scalar()
+                        msgs_week = (await db.execute(
+                            select(sa_func.count(WhatsappLog.id))
+                            .where(WhatsappLog.created_at >= week_ago)
+                            .where(WhatsappLog.direction != 'event')
+                        )).scalar()
+                        msgs_month = (await db.execute(
+                            select(sa_func.count(WhatsappLog.id))
+                            .where(WhatsappLog.created_at >= month_ago)
+                            .where(WhatsappLog.direction != 'event')
+                        )).scalar()
+                        daily_rows = (await db.execute(sa_text(
+                            "SELECT DATE(created_at) as day, COUNT(*) as cnt "
+                            "FROM whatsapp_log "
+                            "WHERE created_at >= NOW() - INTERVAL '30 days' "
+                            "AND direction != 'event' "
+                            "GROUP BY day ORDER BY day ASC"
+                        ))).all()
+                        # build a full 30-day series with 0-fill so chart never has gaps
+                        counts_by_date = {str(r[0]): r[1] for r in daily_rows}
+                        daily = [
+                            {"date": str(today - timedelta(days=i)), "count": counts_by_date.get(str(today - timedelta(days=i)), 0)}
+                            for i in range(29, -1, -1)
+                        ]
+                        return JSONResponse(content={"success": True, "data": {
+                            "today":      msgs_today,
+                            "this_week":  msgs_week,
+                            "this_month": msgs_month,
+                            "daily":      daily,
+                        }}, status_code=200)
+
+                    # ── product_analytics — accurate product demand tracking ──────────
+
+                    case 'product_analytics':
+                        prod_rows = (await db.execute(
+                            select(
+                                WhatsappProductRequest.product_name,
+                                sa_func.count(WhatsappProductRequest.id).label('cnt')
+                            )
+                            .group_by(WhatsappProductRequest.product_name)
+                            .order_by(sa_func.count(WhatsappProductRequest.id).desc())
+                            .limit(50)
+                        )).all()
+                        total_requests = (await db.execute(
+                            select(sa_func.count(WhatsappProductRequest.id))
+                        )).scalar()
+                        unique_products = (await db.execute(
+                            select(sa_func.count(sa_func.distinct(WhatsappProductRequest.product_name)))
+                        )).scalar()
+                        return JSONResponse(content={"success": True, "data": {
+                            "top_products": [{"name": r[0], "count": r[1]} for r in prod_rows],
+                            "total_product_requests":   total_requests,
+                            "unique_products_requested": unique_products,
+                        }}, status_code=200)
+
+                    # ── Business profile (req 6) ────────────────────────────
+
+                    case 'get_profile':
+                        row = await _get_first_business_row(db)
+                        if not row:
+                            raise Exception("no business record found")
+                        d = row.data or {}
+                        return JSONResponse(content={"success": True, "data": {
+                            "id":          str(row.id),
+                            "profile":     d.get('profile', {}),
+                            "title":       d.get('profile', {}).get('title', d.get('title', '')),
+                            "description": d.get('profile', {}).get('description', ''),
+                            "category":    d.get('profile', {}).get('category', ''),
+                            "logo_url":    d.get('profile', {}).get('logo_url', ''),
+                            "phone":       d.get('profile', {}).get('phone', ''),
+                        }}, status_code=200)
+
+                    case 'save_profile':
+                        row = await _get_row(db, body)
+                        if not row:
+                            raise Exception("record not found")
+                        d = dict(row.data or {})
+                        d['profile'] = body.get('profile', body.get('data', {}))
+                        row.data = d
+                        await db.commit()
+                        # push to Meta
+                        warning  = None
+                        meta     = _meta_cfg(row)
+                        token    = meta.get('access_token')
+                        phone_id = meta.get('phone_number_id')
+                        if token and phone_id:
+                            try:
+                                sc, meta_resp = await _push_profile_to_meta(token, phone_id, d['profile'])
+                                if sc != 200:
+                                    warning = f"Saved but Meta push failed: {meta_resp}"
+                            except Exception as e:
+                                warning = f"Saved but Meta push failed: {e}"
+                        resp = {"success": True, "data": {}}
+                        if warning:
+                            resp["warning"] = warning
+                        return JSONResponse(content=resp, status_code=200)
+
                     case _:
                         raise Exception(f"unknown typ={typ}")
 
@@ -964,36 +1922,47 @@ async def index(_p={'data': {'instance': Any}}):
     async def get_schema_for_run(request: Request):
         typ = dict(request.query_params).get('typ')
         _any_id = {"id": {"type": "string"}, "user_id": {"type": "string"}}
+        def _obj(**props):
+            return {"type": "object", "additionalProperties": True, "properties": props}
         _schemas = {
-            'create':               {"type": "object", "required": ["user_id"],
-                                     "properties": {"user_id": {"type": "string"}, "data": {"type": "object"}}},
-            'get':                  {"type": "object", "required": ["id"],
-                                     "properties": {"id": {"type": "string"}}},
-            'list':                 {"type": "object", "required": ["user_id"],
-                                     "properties": {"user_id": {"type": "string"}}},
-            'update':               {"type": "object", "required": ["user_id"],
-                                     "properties": {"user_id": {"type": "string"}, "data": {"type": "object"}}},
-            'delete':               {"type": "object", "required": ["id"],
-                                     "properties": {"id": {"type": "string"}}},
-            'meta_config_save':     {"type": "object", "properties": {**_any_id, "meta": {"type": "object"}, "data": {"type": "object"}}},
-            'save_meta_config':     {"type": "object", "properties": {**_any_id, "meta": {"type": "object"}, "data": {"type": "object"}}},
-            'get_meta_config':      {"type": "object", "properties": _any_id},
-            'meta_test':            {"type": "object", "properties": _any_id},
-            'meta_sync_profile':    {"type": "object", "properties": _any_id},
-            'catalog_sync':         {"type": "object", "properties": {**_any_id,
-                                     "access_token": {"type": "string"}, "base_url": {"type": "string"}}},
-            'catalog_status':       {"type": "object", "properties": _any_id},
-            'webhook_event':        {"type": "object", "properties": {}},
-            'get_automation_config':{"type": "object", "properties": _any_id},
-            'save_automation_config':{"type": "object", "required": ["data"],
-                                      "properties": {**_any_id, "data": {"type": "object"}}},
-            'conversation_list':    {"type": "object", "properties": _any_id},
-            'conversation_messages':{"type": "object", "required": ["phone"],
-                                     "properties": {**_any_id, "phone": {"type": "string"}}},
-            'get_logs':             {"type": "object", "properties": {"limit": {"type": "integer"}}},
-            'send_message':         {"type": "object", "required": ["to", "message"],
-                                     "properties": {**_any_id, "to": {"type": "string"},
-                                                    "message": {"type": "string"}}},
+            'create':               _obj(user_id={"type": "string"}, data={"type": "object"}),
+            'get':                  _obj(id={"type": "string"}),
+            'list':                 _obj(user_id={"type": "string"}),
+            'update':               _obj(user_id={"type": "string"}, data={"type": "object"}),
+            'delete':               _obj(id={"type": "string"}),
+            'meta_config_save':     _obj(id={"type": "string"}, user_id={"type": "string"}, meta={"type": "object"}, data={"type": "object"}),
+            'save_meta_config':     _obj(id={"type": "string"}, user_id={"type": "string"}, meta={"type": "object"}, data={"type": "object"}),
+            'get_meta_config':      _obj(id={"type": "string"}, user_id={"type": "string"}),
+            'meta_test':            _obj(id={"type": "string"}, user_id={"type": "string"}),
+            'meta_sync_profile':    _obj(id={"type": "string"}, user_id={"type": "string"}),
+            'meta_connect':         _obj(id={"type": "string"}, user_id={"type": "string"}, access_token={"type": "string"}),
+            'catalog_sync':         _obj(id={"type": "string"}, user_id={"type": "string"}, access_token={"type": "string"}, base_url={"type": "string"}),
+            'catalog_status':       _obj(id={"type": "string"}, user_id={"type": "string"}),
+            'catalog_validate':     _obj(id={"type": "string"}, user_id={"type": "string"}),
+            'catalog_details':      _obj(id={"type": "string"}, user_id={"type": "string"}),
+            'catalog_sync_full':    _obj(id={"type": "string"}, user_id={"type": "string"}, trigger={"type": "string"}),
+            'catalog_sync_product': _obj(id={"type": "string"}, user_id={"type": "string"}, product={"type": "object"}),
+            'catalog_delete_product': _obj(id={"type": "string"}, user_id={"type": "string"}, retailer_id={"type": "string"}),
+            'catalog_sync_history': _obj(id={"type": "string"}, user_id={"type": "string"}, limit={"type": "integer"}, offset={"type": "integer"}),
+            'catalog_sync_status':  _obj(id={"type": "string"}, user_id={"type": "string"}),
+            'catalog_sync_errors':  _obj(id={"type": "string"}, user_id={"type": "string"}, sync_id={"type": "string"}),
+            'meta_disconnect':       _obj(id={"type": "string"}, user_id={"type": "string"}),
+            'webhook_event':        _obj(),
+            'get_automation_config':_obj(id={"type": "string"}, user_id={"type": "string"}),
+            'save_automation_config':_obj(id={"type": "string"}, user_id={"type": "string"}, data={"type": "object"}),
+            'conversation_list':    _obj(id={"type": "string"}, user_id={"type": "string"}),
+            'conversation_messages':_obj(id={"type": "string"}, user_id={"type": "string"}, phone={"type": "string"}),
+            'get_logs':             _obj(id={"type": "string"}, limit={"type": "integer"}),
+            'send_message':         _obj(id={"type": "string"}, user_id={"type": "string"}, to={"type": "string"}, message={"type": "string"}),
+            'analytics':            _obj(id={"type": "string"}, user_id={"type": "string"}),
+            'customers':            _obj(id={"type": "string"}, user_id={"type": "string"}, limit={"type": "integer"}, offset={"type": "integer"}),
+            'customer_detail':      _obj(id={"type": "string"}, user_id={"type": "string"}, phone={"type": "string"}, customer_id={"type": "string"}),
+            'latest_messages':      _obj(id={"type": "string"}, limit={"type": "integer"}),
+            'message_log':          _obj(id={"type": "string"}, user_id={"type": "string"}, limit={"type": "integer"}, offset={"type": "integer"}),
+            'message_stats':        _obj(id={"type": "string"}, user_id={"type": "string"}),
+            'product_analytics':    _obj(id={"type": "string"}, user_id={"type": "string"}),
+            'get_profile':          _obj(id={"type": "string"}, user_id={"type": "string"}),
+            'save_profile':         _obj(id={"type": "string"}, user_id={"type": "string"}, profile={"type": "object"}, data={"type": "object"}),
         }
         if typ not in _schemas:
             raise Exception(f"no body schema found for [typ={typ}]")
