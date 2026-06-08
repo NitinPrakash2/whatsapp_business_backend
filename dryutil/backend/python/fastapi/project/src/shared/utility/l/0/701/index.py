@@ -904,7 +904,164 @@ async def index(_p={'data': {'instance': Any}}):
                         return JSONResponse(content={"success": True, "data": {"meta_response": meta_resp}},
                                             status_code=200)
 
-                    # ── meta_connect — auto-discover assets (Embedded Signup ready) ──
+                    # ── meta_oauth_start — generate Meta OAuth URL ──────────────────
+
+                    case 'meta_oauth_start':
+                        row = await _get_row(db, body)
+                        if not row:
+                            raise Exception("record not found")
+                        d   = row.data or {}
+                        cfg = d.get('config', {})
+                        app_id       = cfg.get('meta_app_id', '')
+                        redirect_uri = body.get('redirect_uri', cfg.get('oauth_redirect_uri', ''))
+                        state        = body.get('state', str(row.id))  # use business id as state
+                        if not app_id:
+                            raise Exception("meta_app_id not configured in instance config")
+                        if not redirect_uri:
+                            raise Exception("redirect_uri required")
+                        scope = 'whatsapp_business_management,whatsapp_business_messaging,business_management,catalog_management'
+                        auth_url = (
+                            f"https://www.facebook.com/v19.0/dialog/oauth"
+                            f"?client_id={app_id}"
+                            f"&redirect_uri={redirect_uri}"
+                            f"&scope={scope}"
+                            f"&state={state}"
+                            f"&response_type=code"
+                        )
+                        return JSONResponse(content={"success": True, "data": {
+                            "auth_url": auth_url,
+                            "state":    state,
+                        }}, status_code=200)
+
+                    # ── meta_oauth_callback — exchange code, discover assets, save ──
+
+                    case 'meta_oauth_callback':
+                        row = await _get_row(db, body)
+                        if not row:
+                            raise Exception("record not found")
+                        d   = dict(row.data or {})
+                        cfg = dict(d.get('config', {}))
+                        app_id       = cfg.get('meta_app_id', '')
+                        app_secret   = cfg.get('meta_app_secret', '')
+                        redirect_uri = body.get('redirect_uri', cfg.get('oauth_redirect_uri', ''))
+                        code         = body.get('code', '')
+                        if not code:
+                            raise Exception("authorization code is required")
+                        if not app_id or not app_secret:
+                            raise Exception("meta_app_id and meta_app_secret not configured")
+
+                        # 1. exchange code for short-lived token
+                        async with httpx.AsyncClient() as client:
+                            r = await client.get(
+                                "https://graph.facebook.com/v19.0/oauth/access_token",
+                                params={
+                                    "client_id":     app_id,
+                                    "client_secret": app_secret,
+                                    "redirect_uri":  redirect_uri,
+                                    "code":          code,
+                                },
+                                timeout=15
+                            )
+                        token_data = r.json()
+                        if "error" in token_data:
+                            raise Exception(f"Token exchange failed: {token_data['error'].get('message')}")
+                        short_token = token_data.get("access_token", "")
+
+                        # 2. exchange for long-lived token
+                        async with httpx.AsyncClient() as client:
+                            r2 = await client.get(
+                                "https://graph.facebook.com/v19.0/oauth/access_token",
+                                params={
+                                    "grant_type":    "fb_exchange_token",
+                                    "client_id":     app_id,
+                                    "client_secret": app_secret,
+                                    "fb_exchange_token": short_token,
+                                },
+                                timeout=15
+                            )
+                        ll_data = r2.json()
+                        token = ll_data.get("access_token", short_token)
+
+                        # 3. auto-discover all assets
+                        assets = await _meta_discover_assets(token)
+
+                        # 4. auto-select if only one of each
+                        auto_waba    = assets["waba_list"][0]["id"]    if len(assets["waba_list"]) == 1    else None
+                        auto_phone   = assets["phone_list"][0]["id"]   if len(assets["phone_list"]) == 1   else None
+                        auto_catalog = assets["catalog_list"][0]["id"] if len(assets["catalog_list"]) == 1 else None
+
+                        # 5. save config
+                        existing_meta = cfg.get('meta', {})
+                        cfg['meta'] = {
+                            **existing_meta,
+                            'access_token':    token,
+                            'waba_id':         auto_waba    or existing_meta.get('waba_id', ''),
+                            'phone_number_id': auto_phone   or existing_meta.get('phone_number_id', ''),
+                            'catalog_id':      auto_catalog or existing_meta.get('catalog_id', ''),
+                        }
+                        cfg['oauth_connected_at'] = datetime.now(timezone.utc).isoformat()
+                        d['config'] = cfg
+                        row.data = d
+                        await db.commit()
+
+                        return JSONResponse(content={"success": True, "data": {
+                            "connected":     True,
+                            "discovered":    assets,
+                            "auto_selected": {
+                                "waba_id":         auto_waba,
+                                "phone_number_id": auto_phone,
+                                "catalog_id":      auto_catalog,
+                            },
+                            "needs_selection": (
+                                len(assets["waba_list"]) > 1 or
+                                len(assets["catalog_list"]) > 1
+                            ),
+                            "note": "If multiple assets found, call save_meta_config to set specific IDs."
+                        }}, status_code=200)
+
+                    # ── meta_connection_status — seller connection info ─────────────
+
+                    case 'meta_connection_status':
+                        row = await _get_row(db, body)
+                        if not row:
+                            raise Exception("record not found")
+                        d    = row.data or {}
+                        cfg  = d.get('config', {})
+                        meta = cfg.get('meta', {})
+                        token      = meta.get('access_token', '')
+                        catalog_id = meta.get('catalog_id', '')
+                        phone_id   = meta.get('phone_number_id', '')
+                        connected  = bool(token)
+                        business_name = catalog_name = phone_number = ''
+                        if connected:
+                            try:
+                                async with httpx.AsyncClient() as client:
+                                    if catalog_id:
+                                        rc = await client.get(
+                                            f"https://graph.facebook.com/v19.0/{catalog_id}",
+                                            params={"access_token": token, "fields": "id,name"}
+                                        )
+                                        catalog_name = rc.json().get('name', '')
+                                    if phone_id:
+                                        rp = await client.get(
+                                            f"https://graph.facebook.com/v19.0/{phone_id}",
+                                            params={"access_token": token, "fields": "display_phone_number,verified_name"}
+                                        )
+                                        pd = rp.json()
+                                        phone_number  = pd.get('display_phone_number', '')
+                                        business_name = pd.get('verified_name', d.get('profile', {}).get('title', ''))
+                            except Exception:
+                                pass
+                        return JSONResponse(content={"success": True, "data": {
+                            "connected":     connected,
+                            "business_name": business_name or d.get('profile', {}).get('title', ''),
+                            "catalog_name":  catalog_name,
+                            "catalog_id":    catalog_id,
+                            "phone_number":  phone_number,
+                            "waba_id":       meta.get('waba_id', ''),
+                            "connected_at":  cfg.get('oauth_connected_at'),
+                            "access_token_set": connected,
+                        }}, status_code=200)
 
                     case 'meta_connect':
                         # Accepts just an access_token, discovers all WABA/phone/catalog
@@ -1947,6 +2104,9 @@ async def index(_p={'data': {'instance': Any}}):
             'catalog_sync_status':  _obj(id={"type": "string"}, user_id={"type": "string"}),
             'catalog_sync_errors':  _obj(id={"type": "string"}, user_id={"type": "string"}, sync_id={"type": "string"}),
             'meta_disconnect':       _obj(id={"type": "string"}, user_id={"type": "string"}),
+            'meta_oauth_start':       _obj(id={"type": "string"}, user_id={"type": "string"}, redirect_uri={"type": "string"}, state={"type": "string"}),
+            'meta_oauth_callback':    _obj(id={"type": "string"}, user_id={"type": "string"}, code={"type": "string"}, redirect_uri={"type": "string"}),
+            'meta_connection_status': _obj(id={"type": "string"}, user_id={"type": "string"}),
             'webhook_event':        _obj(),
             'get_automation_config':_obj(id={"type": "string"}, user_id={"type": "string"}),
             'save_automation_config':_obj(id={"type": "string"}, user_id={"type": "string"}, data={"type": "object"}),

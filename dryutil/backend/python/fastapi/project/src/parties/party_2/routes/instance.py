@@ -339,6 +339,86 @@ def index(_p={}):
     #============DASHBOARD (WhatsApp CRM)==========# [END]
 
 
+    #============META OAUTH CALLBACK==============# [START]
+    # Meta redirects the seller's browser to this GET route after they grant permissions.
+    # No JWT required — this is a browser redirect from Meta.
+
+    @router.get("/api/meta/oauth/callback")
+    async def meta_oauth_callback(
+        request: Request,
+        db=Depends(get_db)
+    ):
+        params = dict(request.query_params)
+        code   = params.get("code", "")
+        state  = params.get("state", "")  # business_id passed as state
+        error  = params.get("error", "")
+
+        if error:
+            return HTMLResponse(
+                f"<h2>Connection Failed</h2><p>{params.get('error_description', error)}</p>"
+                f"<script>window.opener && window.opener.postMessage({{type:'meta_oauth_error',error:'{error}'}}, '*'); window.close();</script>",
+                status_code=400
+            )
+
+        if not code or not state:
+            return HTMLResponse(
+                "<h2>Invalid callback</h2><p>Missing code or state.</p>",
+                status_code=400
+            )
+
+        # Call meta_oauth_callback typ on the utility
+        # state = business_id (whatsapp_business.id)
+        # We need the instance to get app_secret — use default project/instance
+        from src.shared.util.include_file.index import include_file
+        from sqlalchemy.future import select as sa_select
+        from sqlalchemy.orm import joinedload
+        from src.database.entity.instance import Instance
+        from src.database.entity.project import Project
+        from src.shared.utility.u.fake_req_obj.index import fake_req_obj
+
+        result = await db.execute(
+            sa_select(Instance)
+            .join(Project, Instance.project_id == Project.id)
+            .where(Instance.name == "s_whatsapp_business_mgmt", Project.name == "ona")
+            .options(joinedload(Instance.project), joinedload(Instance.utility))
+        )
+        inst = result.scalar_one_or_none()
+        if not inst:
+            return HTMLResponse("<h2>Instance not found</h2>", status_code=404)
+
+        lib_name, _lib_ = include_file(
+            f"src/shared/utility/l/{inst.utility_id}/index.py", lambda n, m: ()
+        )[0]
+        fn_i, _, __, ___, ____ = await _lib_.index({'data': {'instance': inst}})
+
+        redirect_uri = str(request.url).split("?")[0]  # this URL without query params
+        req = fake_req_obj(
+            method="POST", url="",
+            headers={"content-type": "application/json"},
+            query_params={"typ": "meta_oauth_callback"},
+            path_params={},
+            json_data={"id": state, "code": code, "redirect_uri": redirect_uri},
+            state={},
+        )
+        resp = await fn_i(req)
+
+        # Return HTML that posts message to opener window and closes popup
+        return HTMLResponse("""
+            <html><body>
+            <h2>Connected!</h2><p>Closing window...</p>
+            <script>
+              const data = """ + resp.body.decode() + """;
+              if (window.opener) {
+                window.opener.postMessage({type: 'meta_oauth_success', data: data}, '*');
+              }
+              setTimeout(() => window.close(), 1500);
+            </script>
+            </body></html>
+        """)
+
+    #============META OAUTH CALLBACK==============# [END]
+
+
 
 
 
