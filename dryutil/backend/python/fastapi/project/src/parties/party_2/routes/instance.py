@@ -265,8 +265,6 @@ def index(_p={}):
 
     async def _wa_call(project: str, instance: str, typ: str, body: dict, db):
         """Internal helper: build a fake request and dispatch to the 701 utility."""
-        from starlette.datastructures import QueryParams
-        from src.shared.utility.index import index as utility_index
         from src.shared.utility.u.fake_req_obj.index import fake_req_obj
         req = fake_req_obj(
             method="POST", url="",
@@ -276,8 +274,6 @@ def index(_p={}):
             json_data=body,
             state={},
         )
-        i, _, __, ___, ____ = await utility_index({'data': {}})
-        # resolve the instance so engine is initialised
         from sqlalchemy.future import select
         from sqlalchemy.orm import joinedload
         from src.database.entity.instance import Instance
@@ -345,6 +341,51 @@ def index(_p={}):
         body["id"] = "a25c09e8-9eae-4f27-8bdb-cada50482587"
         return await _wa_call(project, instance, "meta_config_save", body, db)
 
+    @router.post("/api/wa/{project}/{instance}/oauth-start")
+    async def wa_oauth_start(request: Request, project: str, instance: str, db=Depends(get_db)):
+        """Public route for OAuth start — no JWT needed."""
+        body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+        # multi-seller: if user_id provided, find or create their row
+        if "user_id" in body and "id" not in body:
+            from src.shared.util.include_file.index import include_file
+            from sqlalchemy.future import select
+            from sqlalchemy.orm import joinedload
+            from src.database.entity.instance import Instance
+            from src.database.entity.project import Project
+            result = await db.execute(
+                select(Instance)
+                .join(Project, Instance.project_id == Project.id)
+                .where(Instance.name == instance, Project.name == project)
+                .options(joinedload(Instance.project), joinedload(Instance.utility))
+            )
+            inst = result.scalar_one_or_none()
+            if inst:
+                lib_name, _lib_ = include_file(
+                    f"src/shared/utility/l/{inst.utility_id}/index.py", lambda n, m: ()
+                )[0]
+                fn_i, _, __, ___, ____ = await _lib_.index({'data': {'instance': inst}})
+                from src.shared.utility.u.fake_req_obj.index import fake_req_obj
+                # get or create seller row
+                get_req = fake_req_obj(method="POST", url="", headers={"content-type": "application/json"},
+                    query_params={"typ": "list"}, path_params={}, json_data={"user_id": body["user_id"]}, state={})
+                list_resp = await fn_i(get_req)
+                import json as _json
+                list_data = _json.loads(list_resp.body)
+                rows = list_data.get("data", [])
+                if rows:
+                    body["id"] = rows[0]["id"]
+                else:
+                    # create new row for this seller
+                    create_req = fake_req_obj(method="POST", url="", headers={"content-type": "application/json"},
+                        query_params={"typ": "create"}, path_params={},
+                        json_data={"user_id": body["user_id"], "data": {"config": {"meta": {}}}}, state={})
+                    create_resp = await fn_i(create_req)
+                    create_data = _json.loads(create_resp.body)
+                    body["id"] = create_data.get("data", {}).get("id", "")
+        if "id" not in body:
+            body["id"] = "a25c09e8-9eae-4f27-8bdb-cada50482587"
+        return await _wa_call(project, instance, "meta_oauth_start", body, db)
+
     #============DASHBOARD (WhatsApp CRM)==========# [END]
 
 
@@ -408,6 +449,8 @@ def index(_p={}):
 
             # redirect_uri must exactly match what was used in meta_oauth_start
             redirect_uri = str(request.url).split("?")[0]
+
+            # multi-seller: use business_id from state, or create new row for seller
             req = fake_req_obj(
                 method="POST", url="",
                 headers={"content-type": "application/json"},

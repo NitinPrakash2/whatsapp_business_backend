@@ -140,6 +140,59 @@ async def index(_p={'data': {'instance': Any}}):
         result = await db.execute(select(WhatsappBusiness).limit(1))
         return result.scalar_one_or_none()
 
+    async def _get_or_create_row(db, user_id: str, instance_data: dict = None):
+        """Get existing row by user_id or create new one — enables multi-seller."""
+        result = await db.execute(
+            select(WhatsappBusiness).where(WhatsappBusiness.user_id == user_id)
+        )
+        row = result.scalars().first()
+        if not row:
+            row = WhatsappBusiness(
+                user_id=user_id,
+                data=instance_data or {"config": {"meta": {}, "database": {}}}
+            )
+            db.add(row)
+            await db.flush()
+        return row
+
+    async def _refresh_token_if_needed(token: str, app_id: str, app_secret: str) -> str:
+        """Check token expiry and refresh if expiring within 7 days."""
+        if not token or not app_id or not app_secret:
+            return token
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    "https://graph.facebook.com/v19.0/debug_token",
+                    params={"input_token": token, "access_token": f"{app_id}|{app_secret}"},
+                    timeout=10
+                )
+                data = r.json().get("data", {})
+                expires_at = data.get("expires_at", 0)
+                if expires_at == 0:  # never expires (system token)
+                    return token
+                from datetime import datetime, timezone
+                now_ts = datetime.now(timezone.utc).timestamp()
+                days_left = (expires_at - now_ts) / 86400
+                if days_left > 7:
+                    return token  # still valid
+                # refresh token
+                r2 = await client.get(
+                    "https://graph.facebook.com/v19.0/oauth/access_token",
+                    params={
+                        "grant_type": "fb_exchange_token",
+                        "client_id": app_id,
+                        "client_secret": app_secret,
+                        "fb_exchange_token": token,
+                    },
+                    timeout=10
+                )
+                new_token = r2.json().get("access_token", token)
+                print(f"[token_refresh] refreshed token, days_left_was={days_left:.1f}")
+                return new_token
+        except Exception as e:
+            print(f"[token_refresh] failed: {e}")
+            return token
+
     # ── Meta Graph API helpers ──────────────────────────────────────────────
 
     async def _push_profile_to_meta(token: str, phone_id: str, profile: dict):
@@ -1006,7 +1059,7 @@ async def index(_p={'data': {'instance': Any}}):
                         ll_data = r2.json()
                         token = ll_data.get("access_token", short_token)
 
-                        # 3. auto-discover all assets
+                        # 3. auto-discover all assets using seller's token
                         assets = await _meta_discover_assets(token)
 
                         # 4. auto-select if only one of each
@@ -1014,22 +1067,41 @@ async def index(_p={'data': {'instance': Any}}):
                         auto_phone   = assets["phone_list"][0]["id"]   if len(assets["phone_list"]) == 1   else None
                         auto_catalog = assets["catalog_list"][0]["id"] if len(assets["catalog_list"]) == 1 else None
 
-                        # 5. save config — preserve existing IDs and token if already set
+                        # 5. if no catalog found, auto-create one for this seller
+                        if not auto_catalog and auto_waba:
+                            try:
+                                seller_name = (row.data or {}).get('profile', {}).get('title', 'My Store')
+                                async with httpx.AsyncClient() as client:
+                                    # get business_id from WABA
+                                    rw = await client.get(
+                                        f"https://graph.facebook.com/v19.0/{auto_waba}",
+                                        params={"access_token": token, "fields": "id,name,owner_business_info"}
+                                    )
+                                    biz_id = rw.json().get('owner_business_info', {}).get('id', '')
+                                    if biz_id:
+                                        rc = await client.post(
+                                            f"https://graph.facebook.com/v19.0/{biz_id}/owned_product_catalogs",
+                                            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                                            json={"name": f"{seller_name} Catalog"},
+                                            timeout=15
+                                        )
+                                        created = rc.json()
+                                        if "id" in created:
+                                            auto_catalog = created["id"]
+                                            print(f"[oauth_callback] auto-created catalog: {auto_catalog}")
+                            except Exception as e:
+                                print(f"[oauth_callback] catalog auto-create failed: {e}")
+
+                        # 6. save seller's config — use seller's token, their discovered assets
                         existing_meta = cfg.get('meta', {})
-                        existing_token = existing_meta.get('access_token', '')
-                        # keep permanent system token only if it's explicitly marked as system token
-                        # for real sellers, always use the OAuth token they just granted
-                        existing_meta = cfg.get('meta', {})
-                        is_system_token = cfg.get('is_system_token', False)
-                        final_token = existing_meta.get('access_token', '') if is_system_token else token
                         cfg['meta'] = {
                             **existing_meta,
-                            'access_token':    final_token,
+                            'access_token':    token,  # seller's own OAuth token
                             'waba_id':         auto_waba    or existing_meta.get('waba_id', ''),
                             'phone_number_id': auto_phone   or existing_meta.get('phone_number_id', ''),
                             'catalog_id':      auto_catalog or existing_meta.get('catalog_id', ''),
                         }
-                        print(f"[oauth_callback] saved meta cfg: waba={cfg['meta']['waba_id']} phone={cfg['meta']['phone_number_id']} catalog={cfg['meta']['catalog_id']} token_kept_existing={bool(existing_token)}")
+                        print(f"[oauth_callback] seller onboarded: waba={cfg['meta']['waba_id']} phone={cfg['meta']['phone_number_id']} catalog={cfg['meta']['catalog_id']}")
                         cfg['oauth_connected_at'] = datetime.now(timezone.utc).isoformat()
                         d['config'] = cfg
                         row.data = d
@@ -1044,6 +1116,26 @@ async def index(_p={'data': {'instance': Any}}):
                                 await _link_catalog_to_waba(token, _waba_id, _catalog_id, _phone_id)
                             except Exception as e:
                                 print(f"[oauth_callback] catalog link warning: {e}")
+
+                        # 7. auto-sync products to seller's catalog after OAuth
+                        if cfg['meta'].get('catalog_id') and cfg['meta'].get('access_token'):
+                            try:
+                                pd_token = cfg.get('product_dir_token', '')
+                                base_url = cfg.get('base_url', 'https://fastapi.dryutil.1mn.io')
+                                pd_resp  = await _fetch_products(pd_token, base_url, per_page=250)
+                                products = pd_resp.get('data', {}).get('products',
+                                           pd_resp.get('data', {}).get('hits', []))
+                                if isinstance(products, dict):
+                                    products = products.get('hits', products.get('products', []))
+                                if products:
+                                    async with httpx.AsyncClient() as _sync_client:
+                                        for _p in products:
+                                            _doc = _p.get('document', _p)
+                                            _payload = _normalize_product(_doc)
+                                            await _meta_push_one(_sync_client, cfg['meta']['access_token'], cfg['meta']['catalog_id'], _payload)
+                                    print(f"[oauth_callback] auto-synced {len(products)} products to catalog")
+                            except Exception as _e:
+                                print(f"[oauth_callback] auto-sync warning: {_e}")
 
                         return JSONResponse(content={"success": True, "data": {
                             "connected":     True,
@@ -1076,6 +1168,17 @@ async def index(_p={'data': {'instance': Any}}):
                         connected  = bool(token)
                         if not connected:
                             return JSONResponse(content={"success": True, "data": {"connected": False}}, status_code=200)
+
+                        # auto-refresh token if expiring soon
+                        app_id     = cfg.get('meta_app_id', '')
+                        app_secret = cfg.get('meta_app_secret', '')
+                        refreshed_token = await _refresh_token_if_needed(token, app_id, app_secret)
+                        if refreshed_token != token:
+                            cfg['meta'] = {**meta, 'access_token': refreshed_token}
+                            d['config'] = cfg
+                            row.data = d
+                            await db.commit()
+                            token = refreshed_token
                         business_name = catalog_name = phone_number = waba_name = ''
                         catalog_product_count = 0
                         try:
@@ -1104,6 +1207,23 @@ async def index(_p={'data': {'instance': Any}}):
                                     waba_name = rw.json().get('name', '')
                         except Exception:
                             pass
+                        # check token expiry info for frontend warning
+                        token_expires_at = None
+                        token_days_left  = None
+                        try:
+                            async with httpx.AsyncClient() as _tc:
+                                _r = await _tc.get(
+                                    "https://graph.facebook.com/v19.0/debug_token",
+                                    params={"input_token": token, "access_token": f"{app_id}|{app_secret}" if app_id and app_secret else token},
+                                    timeout=8
+                                )
+                                _td = _r.json().get("data", {})
+                                _exp = _td.get("expires_at", 0)
+                                if _exp and _exp > 0:
+                                    token_expires_at = datetime.fromtimestamp(_exp, tz=timezone.utc).isoformat()
+                                    token_days_left  = round((_exp - datetime.now(timezone.utc).timestamp()) / 86400)
+                        except Exception:
+                            pass
                         return JSONResponse(content={"success": True, "data": {
                             "connected":             True,
                             "business_name":         business_name or d.get('profile', {}).get('title', ''),
@@ -1113,8 +1233,11 @@ async def index(_p={'data': {'instance': Any}}):
                             "catalog_product_count": catalog_product_count,
                             "catalog_id":            catalog_id,
                             "waba_id":               waba_id,
+                            "phone_number_id":       phone_id,
                             "connected_at":          cfg.get('oauth_connected_at'),
                             "access_token_set":      True,
+                            "token_expires_at":      token_expires_at,
+                            "token_days_left":       token_days_left,
                         }}, status_code=200)
 
                     case 'meta_connect':
@@ -1526,9 +1649,12 @@ async def index(_p={'data': {'instance': Any}}):
                             raise Exception("record not found")
                         d   = dict(row.data or {})
                         cfg = dict(d.get('config', {}))
+                        existing_meta = cfg.get('meta', {})
+                        # only clear the token — preserve WABA/phone/catalog IDs
+                        # so reconnect works without manual re-entry
                         cfg['meta'] = {
-                            'access_token': '', 'waba_id': '',
-                            'phone_number_id': '', 'catalog_id': ''
+                            **existing_meta,
+                            'access_token': '',
                         }
                         cfg.pop('oauth_connected_at', None)
                         d['config'] = cfg
@@ -2025,7 +2151,9 @@ async def index(_p={'data': {'instance': Any}}):
                     # ── Business profile (req 6) ────────────────────────────
 
                     case 'get_profile':
-                        row = await _get_first_business_row(db)
+                        row = await _get_row(db, body)
+                        if not row:
+                            row = await _get_first_business_row(db)
                         if not row:
                             raise Exception("no business record found")
                         d = row.data or {}
@@ -2043,18 +2171,22 @@ async def index(_p={'data': {'instance': Any}}):
                         row = await _get_row(db, body)
                         if not row:
                             raise Exception("record not found")
-                        d = dict(row.data or {})
-                        d['profile'] = body.get('profile', body.get('data', {}))
-                        row.data = d
+                        profile_data = body.get('profile', body.get('data', {}))
+                        _meta = _meta_cfg(row)
+                        _token = _meta.get('access_token')
+                        _phone_id = _meta.get('phone_number_id')
+                        _row_id = str(row.id)
+                        import json as _json
+                        from sqlalchemy import text as sa_text
+                        _profile_json = _json.dumps(profile_data).replace("'", "''")
+                        await db.execute(sa_text(
+                            f"UPDATE whatsapp_business SET data = jsonb_set(data, '{{profile}}', '{_profile_json}'::jsonb) WHERE id = '{_row_id}'::uuid"
+                        ))
                         await db.commit()
-                        # push to Meta
-                        warning  = None
-                        meta     = _meta_cfg(row)
-                        token    = meta.get('access_token')
-                        phone_id = meta.get('phone_number_id')
-                        if token and phone_id:
+                        warning = None
+                        if _token and _phone_id:
                             try:
-                                sc, meta_resp = await _push_profile_to_meta(token, phone_id, d['profile'])
+                                sc, meta_resp = await _push_profile_to_meta(_token, _phone_id, profile_data)
                                 if sc != 200:
                                     warning = f"Saved but Meta push failed: {meta_resp}"
                             except Exception as e:
